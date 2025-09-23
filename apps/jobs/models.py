@@ -2,6 +2,7 @@
 Job models for the job scraper application.
 """
 
+import logging
 from django.db import models
 from django.contrib.auth import get_user_model
 from django.utils.text import slugify
@@ -159,11 +160,11 @@ class JobPosting(models.Model):
         """Return formatted salary string."""
         if self.salary_min and self.salary_max:
             if self.salary_min == self.salary_max:
-                return f"{self.salary_currency} {self.salary_min:,.0f} per {self.salary_type}"
+                return "{} {:,.0f} per {}".format(self.salary_currency, self.salary_min, self.salary_type)
             else:
-                return f"{self.salary_currency} {self.salary_min:,.0f} - {self.salary_max:,.0f} per {self.salary_type}"
+                return "{} {:,.0f} - {:,.0f} per {}".format(self.salary_currency, self.salary_min, self.salary_max, self.salary_type)
         elif self.salary_min:
-            return f"{self.salary_currency} {self.salary_min:,.0f} per {self.salary_type}"
+            return "{} {:,.0f} per {}".format(self.salary_currency, self.salary_min, self.salary_type)
         elif self.salary_raw_text:
             return self.salary_raw_text
         return "Salary not specified"
@@ -320,3 +321,161 @@ class JobSyncJobResult(models.Model):
 
     def __str__(self):
         return f"Job {self.job_id} -> {self.portal_result.portal_name} ({'OK' if self.was_success else 'FAIL'})"
+
+
+
+# Node Management Models for EvolGroups Integration
+class Tbl_Node_Users(models.Model):
+    """Local node users for EvolGroups integration."""
+    node_users_id = models.AutoField(primary_key=True)
+    user_name = models.CharField(max_length=200)
+    egc_user_id = models.IntegerField(null=True, blank=True)  # From EvolGroups
+    profile_path = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        verbose_name = 'Node User'
+        verbose_name_plural = 'Node Users'
+    
+    def __str__(self):
+        return f"{self.user_name} (EGC: {self.egc_user_id})"
+
+
+class Tbl_Machine_Registry(models.Model):
+    """Registry of machines that send data to EvolGroups."""
+    machine_id = models.CharField(max_length=100, unique=True, help_text="Unique machine UUID")
+    hostname = models.CharField(max_length=100)
+    username = models.CharField(max_length=100)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    
+    # Registration info
+    first_seen = models.DateTimeField(auto_now_add=True)
+    last_seen = models.DateTimeField(auto_now=True)
+    is_authorized = models.BooleanField(default=True)
+    
+    # Authentication tokens
+    access_token = models.CharField(max_length=100, blank=True)
+    token_secret = models.CharField(max_length=100, blank=True)
+    
+    # Status tracking
+    total_transmissions = models.PositiveIntegerField(default=0)
+    successful_transmissions = models.PositiveIntegerField(default=0)
+    last_transmission_status = models.CharField(max_length=20, default='pending')
+    
+    class Meta:
+        ordering = ['-last_seen']
+        verbose_name = 'Machine Registry'
+        verbose_name_plural = 'Machine Registries'
+    
+    def __str__(self):
+        return f"{self.hostname} ({self.username})"
+    
+    @property
+    def success_rate(self):
+        """Calculate transmission success rate."""
+        if self.total_transmissions == 0:
+            return 0.0
+        return (self.successful_transmissions / self.total_transmissions) * 100
+
+
+class Tbl_Job_Transmission_Log(models.Model):
+    """Log of job data transmissions to EvolGroups."""
+    machine = models.ForeignKey(Tbl_Machine_Registry, on_delete=models.CASCADE, related_name='transmissions')
+    
+    # Transmission details
+    transmission_id = models.CharField(max_length=50, unique=True, help_text="Unique ID for this transmission")
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    # Data statistics
+    jobs_sent = models.PositiveIntegerField(default=0)
+    updates_sent = models.PositiveIntegerField(default=0)
+    total_payload_size = models.PositiveIntegerField(default=0, help_text="Size in bytes")
+    
+    # Status and result
+    status = models.CharField(max_length=20, choices=[
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+        ('timeout', 'Timeout')
+    ], default='pending')
+    
+    response_status_code = models.PositiveIntegerField(null=True, blank=True)
+    response_message = models.TextField(blank=True)
+    error_message = models.TextField(blank=True)
+    
+    # Encryption and security
+    was_encrypted = models.BooleanField(default=True)
+    encryption_method = models.CharField(max_length=50, default='Fernet')
+    
+    class Meta:
+        ordering = ['-started_at']
+        verbose_name = 'Job Transmission Log'
+        verbose_name_plural = 'Job Transmission Logs'
+    
+    def __str__(self):
+        return f"Transmission {self.transmission_id} - {self.status}"
+    
+    @property
+    def duration(self):
+        """Calculate transmission duration."""
+        if self.completed_at and self.started_at:
+            return self.completed_at - self.started_at
+        return None
+
+
+class Tbl_Job_Transmission_Items(models.Model):
+    """Individual job items within a transmission."""
+    transmission_log = models.ForeignKey(Tbl_Job_Transmission_Log, on_delete=models.CASCADE, related_name='items')
+    job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE)
+    
+    # Item details
+    item_type = models.CharField(max_length=20, choices=[
+        ('new_job', 'New Job'),
+        ('job_update', 'Job Update'),
+        ('status_change', 'Status Change')
+    ])
+    
+    # Transmission result for this specific item
+    was_successful = models.BooleanField(default=False)
+    error_details = models.TextField(blank=True)
+    
+    # Metadata
+    sent_at = models.DateTimeField(auto_now_add=True)
+    payload_data = models.JSONField(default=dict, blank=True, help_text="The actual data sent for this job")
+    
+    class Meta:
+        ordering = ['-sent_at']
+        verbose_name = 'Job Transmission Item'
+        verbose_name_plural = 'Job Transmission Items'
+    
+    def __str__(self):
+        return f"{self.item_type}: {self.job_posting.title} ({'✓' if self.was_successful else '✗'})"
+
+
+# Local user creation function (enhanced)
+def save_node_user(record):
+    """Save or update node user from EvolGroups response."""
+    try:
+        user, created = Tbl_Node_Users.objects.get_or_create(
+            user_name=record.get('sender_id__username', record.get('username', 'unknown')),
+            defaults={
+                'egc_user_id': record.get('sender_id', record.get('user_id')),
+                'profile_path': record.get('profile_path', ''),
+                'is_active': True
+            }
+        )
+        
+        if not created:
+            # Update existing user
+            user.egc_user_id = record.get('sender_id', record.get('user_id', user.egc_user_id))
+            user.is_active = True
+            user.save()
+        
+        return user
+    except Exception as e:
+        logging.error(f"Failed to save node user: {e}")
+        return None

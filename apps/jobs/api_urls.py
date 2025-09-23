@@ -17,6 +17,9 @@ from .api_views import (
 # Add new imports for sync model viewsets
 from .api_views import JobSyncRunViewSet, JobSyncPortalResultViewSet, JobSyncJobResultViewSet
 
+# Add new imports for job data reception
+from .api_views import JobDataReceptionView, job_data_stats, registered_machines
+
 router = DefaultRouter()
 router.register(r'jobs', JobPostingViewSet, basename='job')
 router.register(r'job-scripts', JobScriptViewSet, basename='jobscript')
@@ -33,4 +36,9 @@ router.register(r'job-sync/job-results', JobSyncJobResultViewSet, basename='job-
 
 urlpatterns = [
     path('', include(router.urls)),
+    
+    # Job Data Reception Endpoints (for nodemanager.py integration)
+    path('receive-job-data/', JobDataReceptionView.as_view(), name='receive-job-data'),
+    path('job-data-stats/', job_data_stats, name='job-data-stats'),
+    path('registered-machines/', registered_machines, name='registered-machines'),
 ]

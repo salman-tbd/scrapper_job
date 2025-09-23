@@ -4,7 +4,10 @@ Admin configuration for job models.
 
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import JobPosting, JobScript, JobScheduler, JobSyncRun, JobSyncPortalResult, JobSyncJobResult
+from .models import (
+    JobPosting, JobScript, JobScheduler, JobSyncRun, JobSyncPortalResult, JobSyncJobResult,
+    Tbl_Node_Users, Tbl_Machine_Registry, Tbl_Job_Transmission_Log, Tbl_Job_Transmission_Items
+)
 
 
 @admin.register(JobPosting)
@@ -169,3 +172,167 @@ class JobSyncJobResultAdmin(admin.ModelAdmin):
     list_filter = ['was_success', 'response_status', 'created_at']
     search_fields = ['job_id', 'request_url', 'error']
     readonly_fields = ['created_at']
+
+
+# Node Management Admin Configurations for EvolGroups Integration
+
+@admin.register(Tbl_Node_Users)
+class TblNodeUsersAdmin(admin.ModelAdmin):
+    """Admin configuration for Node Users."""
+    list_display = ['node_users_id', 'user_name', 'egc_user_id', 'is_active', 'created_at', 'updated_at']
+    list_filter = ['is_active', 'created_at', 'updated_at']
+    search_fields = ['user_name', 'egc_user_id', 'profile_path']
+    readonly_fields = ['node_users_id', 'created_at', 'updated_at']
+    
+    fieldsets = (
+        ('User Information', {
+            'fields': ('user_name', 'egc_user_id', 'is_active')
+        }),
+        ('Profile Settings', {
+            'fields': ('profile_path',),
+            'classes': ('collapse',)
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+
+@admin.register(Tbl_Machine_Registry)
+class TblMachineRegistryAdmin(admin.ModelAdmin):
+    """Admin configuration for Machine Registry."""
+    list_display = [
+        'machine_id', 'hostname', 'username', 'ip_address', 
+        'is_authorized', 'success_rate_display', 'last_seen', 'total_transmissions'
+    ]
+    list_filter = ['is_authorized', 'last_transmission_status', 'first_seen', 'last_seen']
+    search_fields = ['machine_id', 'hostname', 'username', 'ip_address']
+    readonly_fields = ['first_seen', 'last_seen', 'success_rate_display']
+    
+    fieldsets = (
+        ('Machine Information', {
+            'fields': ('machine_id', 'hostname', 'username', 'ip_address', 'is_authorized')
+        }),
+        ('Authentication', {
+            'fields': ('access_token', 'token_secret'),
+            'classes': ('collapse',)
+        }),
+        ('Statistics', {
+            'fields': (
+                'total_transmissions', 'successful_transmissions', 
+                'last_transmission_status', 'success_rate_display'
+            ),
+            'classes': ('collapse',)
+        }),
+        ('Timestamps', {
+            'fields': ('first_seen', 'last_seen'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def success_rate_display(self, obj):
+        """Display success rate with formatting."""
+        rate = obj.success_rate
+        if rate >= 90:
+            color = 'green'
+        elif rate >= 70:
+            color = 'orange'
+        else:
+            color = 'red'
+        
+        # Pre-format the rate to avoid f-string issues
+        formatted_rate = "{:.1f}%".format(rate)
+        
+        return format_html(
+            '<span style="color: {};">{}</span>',
+            color, formatted_rate
+        )
+    
+    success_rate_display.short_description = 'Success Rate'
+    success_rate_display.admin_order_field = 'successful_transmissions'
+
+
+@admin.register(Tbl_Job_Transmission_Log)
+class TblJobTransmissionLogAdmin(admin.ModelAdmin):
+    """Admin configuration for Job Transmission Log."""
+    list_display = [
+        'transmission_id', 'machine', 'status', 'jobs_sent', 'updates_sent', 
+        'was_encrypted', 'duration_display', 'started_at'
+    ]
+    list_filter = ['status', 'was_encrypted', 'encryption_method', 'started_at']
+    search_fields = ['transmission_id', 'machine__hostname', 'machine__username', 'response_message']
+    readonly_fields = ['started_at', 'completed_at', 'duration_display']
+    date_hierarchy = 'started_at'
+    ordering = ['-started_at']
+    
+    fieldsets = (
+        ('Transmission Details', {
+            'fields': ('transmission_id', 'machine', 'status')
+        }),
+        ('Data Statistics', {
+            'fields': ('jobs_sent', 'updates_sent', 'total_payload_size')
+        }),
+        ('Response Information', {
+            'fields': ('response_status_code', 'response_message', 'error_message'),
+            'classes': ('collapse',)
+        }),
+        ('Security', {
+            'fields': ('was_encrypted', 'encryption_method'),
+            'classes': ('collapse',)
+        }),
+        ('Timing', {
+            'fields': ('started_at', 'completed_at', 'duration_display'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def duration_display(self, obj):
+        """Display transmission duration."""
+        duration = obj.duration
+        if duration:
+            total_seconds = int(duration.total_seconds())
+            if total_seconds < 60:
+                return f"{total_seconds}s"
+            else:
+                minutes = total_seconds // 60
+                seconds = total_seconds % 60
+                return f"{minutes}m {seconds}s"
+        return 'N/A'
+    
+    duration_display.short_description = 'Duration'
+
+
+@admin.register(Tbl_Job_Transmission_Items)
+class TblJobTransmissionItemsAdmin(admin.ModelAdmin):
+    """Admin configuration for Job Transmission Items."""
+    list_display = [
+        'id', 'transmission_log', 'job_posting', 'item_type', 
+        'was_successful', 'sent_at'
+    ]
+    list_filter = ['item_type', 'was_successful', 'sent_at']
+    search_fields = [
+        'transmission_log__transmission_id', 'job_posting__title', 
+        'job_posting__company__name', 'error_details'
+    ]
+    readonly_fields = ['sent_at']
+    date_hierarchy = 'sent_at'
+    ordering = ['-sent_at']
+    
+    fieldsets = (
+        ('Transmission Item Details', {
+            'fields': ('transmission_log', 'job_posting', 'item_type', 'was_successful')
+        }),
+        ('Error Information', {
+            'fields': ('error_details',),
+            'classes': ('collapse',)
+        }),
+        ('Payload Data', {
+            'fields': ('payload_data',),
+            'classes': ('collapse',)
+        }),
+        ('Timestamp', {
+            'fields': ('sent_at',),
+            'classes': ('collapse',)
+        }),
+    )

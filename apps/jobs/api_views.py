@@ -2,9 +2,10 @@
 API views for the jobs app.
 """
 
-from rest_framework import viewsets, filters, permissions
-from rest_framework.decorators import action
+from rest_framework import viewsets, filters, permissions, status as http_status
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.db.models import Q, Count
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -33,6 +34,20 @@ from .serializers import (
 # Add imports for sync models and serializers
 from .models import JobSyncRun, JobSyncPortalResult, JobSyncJobResult
 from .serializers import JobSyncRunSerializer, JobSyncPortalResultSerializer, JobSyncJobResultSerializer
+
+# Add imports for job data reception
+from .models import Tbl_Machine_Registry, Tbl_Job_Transmission_Log, Tbl_Job_Transmission_Items, Tbl_Node_Users
+import json
+import logging
+import uuid
+from datetime import datetime
+
+# Encryption support
+try:
+    from cryptography.fernet import Fernet
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
 
 
 class JobPostingViewSet(viewsets.ModelViewSet):
@@ -419,3 +434,385 @@ class JobSyncJobResultViewSet(ReadOnlyListViewSet):
     search_fields = ['job_id', 'request_url', 'error']
     ordering_fields = ['created_at', 'response_status', 'was_success']
     ordering = ['-created_at']
+
+
+# Job Data Reception API for EvolGroups Integration
+logger = logging.getLogger(__name__)
+
+class JobDataReceptionView(APIView):
+    """
+    Django REST Framework view to receive job data from nodemanager.py
+    Following the exact flow pattern from the WhatsApp message system.
+    """
+    permission_classes = [permissions.AllowAny]  # Allow nodemanager to send data
+    
+    def __init__(self):
+        super().__init__()
+        # Use the same encryption key as nodemanager.py
+        self.encryption_key = b'PWhqmT8_Tq5HRz5vIsoJBU9gBDOloo1qJG3fyzZOwfM='
+        self.fernet = None
+        
+        if ENCRYPTION_AVAILABLE:
+            try:
+                self.fernet = Fernet(self.encryption_key)
+                logger.info("🔐 Job data reception encryption initialized")
+            except Exception as e:
+                logger.error(f"❌ Encryption initialization failed: {e}")
+                self.fernet = None
+    
+    def decrypt_data(self, encrypted_data: bytes):
+        """Decrypt received data using Fernet encryption."""
+        if not self.fernet:
+            return None
+        
+        try:
+            decrypted_bytes = self.fernet.decrypt(encrypted_data)
+            data = json.loads(decrypted_bytes.decode())
+            return data
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            return None
+    
+    def encrypt_response(self, response_data: dict):
+        """Encrypt response data for sending back to nodemanager."""
+        if not self.fernet:
+            return None
+        
+        try:
+            message = json.dumps(response_data, default=str).encode('utf-8')
+            encrypted_data = self.fernet.encrypt(message)
+            return encrypted_data
+        except Exception as e:
+            logger.error(f"Response encryption failed: {e}")
+            return None
+    
+    def register_or_update_machine(self, machine_info: dict) -> bool:
+        """Register or update machine information in Django database."""
+        try:
+            machine_id = machine_info.get('machine_id')
+            hostname = machine_info.get('host_name', 'unknown')
+            username = machine_info.get('windows_login_name', 'unknown')
+            access_token = machine_info.get('access_token', '')
+            token_secret = machine_info.get('token_secret', '')
+            
+            # Get or create machine registry
+            machine, created = Tbl_Machine_Registry.objects.get_or_create(
+                machine_id=machine_id,
+                defaults={
+                    'hostname': hostname,
+                    'username': username,
+                    'access_token': access_token,
+                    'token_secret': token_secret,
+                    'total_transmissions': 1,
+                    'successful_transmissions': 0,
+                    'is_authorized': True
+                }
+            )
+            
+            if not created:
+                # Update existing machine
+                machine.hostname = hostname
+                machine.username = username
+                machine.access_token = access_token
+                machine.token_secret = token_secret
+                machine.total_transmissions += 1
+                machine.last_seen = timezone.now()
+                machine.save()
+                
+                logger.info(f"🔄 Updated existing machine: {hostname} ({username})")
+            else:
+                logger.info(f"✨ Registered new machine: {hostname} ({username})")
+            
+            return machine
+            
+        except Exception as e:
+            logger.error(f"Failed to register/update machine: {e}")
+            return None
+    
+    def store_job_data(self, machine, job_data: dict, transmission_log) -> int:
+        """Store received job data in Django database."""
+        try:
+            stored_count = 0
+            
+            # Store new jobs
+            new_jobs = job_data.get('new_jobs', [])
+            for job_data_item in new_jobs:
+                try:
+                    # Get the original job posting if it exists
+                    job_id = job_data_item.get('job_id')
+                    if job_id:
+                        try:
+                            job_posting = JobPosting.objects.get(id=job_id)
+                            
+                            # Create transmission item record
+                            Tbl_Job_Transmission_Items.objects.create(
+                                transmission_log=transmission_log,
+                                job_posting=job_posting,
+                                item_type='new_job',
+                                was_successful=True,
+                                payload_data=job_data_item
+                            )
+                            stored_count += 1
+                            
+                        except JobPosting.DoesNotExist:
+                            logger.warning(f"Job ID {job_id} not found in database")
+                            
+                except Exception as item_error:
+                    logger.error(f"Failed to store individual job: {item_error}")
+            
+            # Handle job updates
+            job_updates = job_data.get('job_updates', [])
+            for update_item in job_updates:
+                try:
+                    job_id = update_item.get('job_id')
+                    if job_id:
+                        try:
+                            job_posting = JobPosting.objects.get(id=job_id)
+                            
+                            # Create transmission item record for update
+                            Tbl_Job_Transmission_Items.objects.create(
+                                transmission_log=transmission_log,
+                                job_posting=job_posting,
+                                item_type='job_update',
+                                was_successful=True,
+                                payload_data=update_item
+                            )
+                            
+                        except JobPosting.DoesNotExist:
+                            logger.warning(f"Job ID {job_id} not found for update")
+                            
+                except Exception as update_error:
+                    logger.error(f"Failed to store job update: {update_error}")
+            
+            logger.info(f"💾 Stored {stored_count} new jobs and {len(job_updates)} updates from machine {machine.hostname}")
+            return stored_count
+            
+        except Exception as e:
+            logger.error(f"Failed to store job data: {e}")
+            return 0
+    
+    def get(self, request):
+        """Handle GET requests - return server status."""
+        try:
+            total_machines = Tbl_Machine_Registry.objects.count()
+            total_transmissions = Tbl_Job_Transmission_Log.objects.count()
+            
+            return Response({
+                'status': 'ready',
+                'message': 'Django Job Data Reception Server is ready',
+                'server_time': timezone.now().isoformat(),
+                'total_machines': total_machines,
+                'total_transmissions': total_transmissions,
+                'encryption_available': ENCRYPTION_AVAILABLE
+            })
+        except Exception as e:
+            logger.error(f"Error in GET request: {e}")
+            return Response(
+                {'error': str(e)},
+                status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def post(self, request):
+        """Handle POST requests - receive job data from nodemanager.py."""
+        try:
+            # Get request data
+            request_data = request.body
+            content_type = request.META.get('CONTENT_TYPE', 'application/json')
+            
+            logger.info(f"📥 Received job data transmission")
+            logger.info(f"   Content-Type: {content_type}")
+            logger.info(f"   Data size: {len(request_data)} bytes")
+            
+            if not request_data:
+                return Response(
+                    {'error': 'No data received'},
+                    status=http_status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Determine if data is encrypted and decrypt
+            is_encrypted = content_type == 'application/octet-stream'
+            
+            if is_encrypted and self.fernet:
+                data = self.decrypt_data(request_data)
+                if not data:
+                    return Response(
+                        {'error': 'Decryption failed'},
+                        status=http_status.HTTP_400_BAD_REQUEST
+                    )
+                logger.info("   🔓 Successfully decrypted data")
+            else:
+                # Handle as JSON
+                try:
+                    data = json.loads(request_data.decode('utf-8'))
+                    logger.info("   📄 Processing JSON data")
+                except json.JSONDecodeError as e:
+                    return Response(
+                        {'error': f'Invalid JSON data: {e}'},
+                        status=http_status.HTTP_400_BAD_REQUEST
+                    )
+            
+            # Extract components
+            machine_info = data.get('machine_info', {})
+            job_data = data.get('job_data', {})
+            system_stats = data.get('system_stats', {})
+            
+            machine_id = machine_info.get('machine_id')
+            if not machine_id:
+                return Response(
+                    {'error': 'Missing machine_id'},
+                    status=http_status.HTTP_400_BAD_REQUEST
+                )
+            
+            logger.info(f"   🖥️ Machine: {machine_info.get('host_name')} ({machine_info.get('windows_login_name')})")
+            logger.info(f"   🔑 Machine ID: {machine_id}")
+            
+            # Register/update machine
+            machine = self.register_or_update_machine(machine_info)
+            if not machine:
+                return Response(
+                    {'error': 'Machine registration failed'},
+                    status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            # Create transmission log
+            transmission_id = str(uuid.uuid4())[:12]
+            new_jobs = job_data.get('new_jobs', [])
+            job_updates = job_data.get('job_updates', [])
+            
+            transmission_log = Tbl_Job_Transmission_Log.objects.create(
+                machine=machine,
+                transmission_id=transmission_id,
+                jobs_sent=len(new_jobs),
+                updates_sent=len(job_updates),
+                total_payload_size=len(request_data),
+                status='in_progress',
+                was_encrypted=is_encrypted,
+                encryption_method='Fernet' if is_encrypted else 'None'
+            )
+            
+            # Store job data
+            stored_count = self.store_job_data(machine, job_data, transmission_log)
+            
+            # Update transmission log
+            transmission_log.status = 'success'
+            transmission_log.completed_at = timezone.now()
+            transmission_log.save()
+            
+            # Update machine success count
+            machine.successful_transmissions += 1
+            machine.last_transmission_status = 'success'
+            machine.save()
+            
+            # Prepare response
+            response_data = {
+                'status': 'success',
+                'message': f'Successfully processed {len(new_jobs)} jobs and {len(job_updates)} updates',
+                'transmission_id': transmission_id,
+                'jobs_processed': len(new_jobs),
+                'updates_processed': len(job_updates),
+                'jobs_stored': stored_count,
+                'server_time': timezone.now().isoformat(),
+                'machine_stats': {
+                    'total_transmissions': machine.total_transmissions,
+                    'successful_transmissions': machine.successful_transmissions,
+                    'success_rate': machine.success_rate,
+                    'last_seen': machine.last_seen.isoformat() if machine.last_seen else None
+                }
+            }
+            
+            logger.info(f"   ✅ Successfully processed transmission {transmission_id}")
+            
+            # Try to encrypt response if client sent encrypted data
+            if is_encrypted and self.fernet:
+                encrypted_response = self.encrypt_response(response_data)
+                if encrypted_response:
+                    from django.http import HttpResponse
+                    response = HttpResponse(
+                        encrypted_response,
+                        content_type='application/octet-stream'
+                    )
+                    return response
+            
+            return Response(response_data)
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing job data: {e}")
+            return Response(
+                {'error': str(e)},
+                status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def job_data_stats(request):
+    """Get job data reception statistics."""
+    try:
+        total_machines = Tbl_Machine_Registry.objects.count()
+        total_transmissions = Tbl_Job_Transmission_Log.objects.count()
+        successful_transmissions = Tbl_Job_Transmission_Log.objects.filter(status='success').count()
+        
+        # Get recent transmissions
+        recent_transmissions = Tbl_Job_Transmission_Log.objects.select_related('machine').order_by('-started_at')[:10]
+        
+        recent_data = []
+        for transmission in recent_transmissions:
+            recent_data.append({
+                'transmission_id': transmission.transmission_id,
+                'machine_hostname': transmission.machine.hostname,
+                'machine_username': transmission.machine.username,
+                'jobs_sent': transmission.jobs_sent,
+                'updates_sent': transmission.updates_sent,
+                'status': transmission.status,
+                'started_at': transmission.started_at.isoformat(),
+                'was_encrypted': transmission.was_encrypted
+            })
+        
+        return Response({
+            'total_machines': total_machines,
+            'total_transmissions': total_transmissions,
+            'successful_transmissions': successful_transmissions,
+            'success_rate': (successful_transmissions / total_transmissions * 100) if total_transmissions > 0 else 0,
+            'recent_transmissions': recent_data,
+            'server_time': timezone.now().isoformat()
+        })
+        
+    except Exception as e:
+        return Response(
+            {'error': str(e)},
+            status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def registered_machines(request):
+    """Get list of registered machines."""
+    try:
+        machines = Tbl_Machine_Registry.objects.all().order_by('-last_seen')
+        
+        machines_data = []
+        for machine in machines:
+            machines_data.append({
+                'machine_id': machine.machine_id,
+                'hostname': machine.hostname,
+                'username': machine.username,
+                'is_authorized': machine.is_authorized,
+                'total_transmissions': machine.total_transmissions,
+                'successful_transmissions': machine.successful_transmissions,
+                'success_rate': machine.success_rate,
+                'first_seen': machine.first_seen.isoformat() if machine.first_seen else None,
+                'last_seen': machine.last_seen.isoformat() if machine.last_seen else None,
+                'last_transmission_status': machine.last_transmission_status
+            })
+        
+        return Response({
+            'machines': machines_data,
+            'total_count': len(machines_data)
+        })
+        
+    except Exception as e:
+        return Response(
+            {'error': str(e)},
+            status=http_status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
