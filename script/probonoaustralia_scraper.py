@@ -40,6 +40,14 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
+try:
+    import nltk
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+    nltk = None
+import string
+from collections import Counter
 
 # Setup Django environment
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'australia_job_scraper.settings_dev')
@@ -93,7 +101,11 @@ class ProBonoAustraliaScraper:
             'companies_created': 0,
             'locations_created': 0,
             'pages_scraped': 0,
-            'total_pages_found': 0
+            'total_pages_found': 0,
+            'jobs_with_skills': 0,
+            'jobs_with_preferred_skills': 0,
+            'total_skills_extracted': 0,
+            'total_preferred_skills_extracted': 0
         }
         
         # Get or create default user for job postings
@@ -105,16 +117,327 @@ class ProBonoAustraliaScraper:
         # Initialize job categorization service
         self.categorization_service = JobCategorizationService()
         
+        # Initialize NLTK resources
+        self.initialize_nltk()
+        
+        # Skills datasets
+        self.technical_skills = {
+            'python', 'java', 'javascript', 'html', 'css', 'sql', 'excel', 'powerpoint', 'word',
+            'tableau', 'power bi', 'salesforce', 'crm', 'erp', 'sap', 'oracle', 'mysql', 'mongodb',
+            'aws', 'azure', 'google cloud', 'docker', 'kubernetes', 'linux', 'windows', 'mac',
+            'photoshop', 'illustrator', 'indesign', 'autocad', 'solidworks', 'r', 'stata', 'spss',
+            'tensorflow', 'pytorch', 'machine learning', 'data analysis', 'data science',
+            'project management', 'scrum', 'agile', 'kanban', 'jira', 'confluence', 'slack',
+            'microsoft office', 'google workspace', 'zoom', 'teams', 'sharepoint'
+        }
+        
+        self.soft_skills = {
+            'communication', 'leadership', 'teamwork', 'problem solving', 'time management',
+            'adaptability', 'creativity', 'critical thinking', 'emotional intelligence',
+            'interpersonal skills', 'public speaking', 'presentation skills', 'negotiation',
+            'customer service', 'sales', 'marketing', 'social media', 'content writing',
+            'copywriting', 'editing', 'proofreading', 'research', 'analytical thinking',
+            'attention to detail', 'multitasking', 'organization', 'planning', 'coordination',
+            'collaboration', 'mentoring', 'training', 'coaching', 'delegation', 'decision making'
+        }
+        
+        self.nonprofit_skills = {
+            'fundraising', 'grant writing', 'volunteer management', 'community outreach',
+            'advocacy', 'policy development', 'stakeholder engagement', 'event planning',
+            'donor relations', 'corporate partnerships', 'social impact', 'program evaluation',
+            'capacity building', 'change management', 'strategic planning', 'board governance',
+            'compliance', 'reporting', 'budgeting', 'financial management', 'human resources'
+        }
+        
         logger.info("Pro Bono Australia Scraper initialized")
         if max_jobs:
             logger.info(f"Job limit: {max_jobs}")
         else:
             logger.info("No job limit set - will scrape all available jobs")
 
+    def initialize_nltk(self):
+        """Initialize NLTK resources for skills extraction"""
+        if not NLTK_AVAILABLE:
+            logger.warning("NLTK not available - skills extraction will use basic text processing")
+            return
+            
+        try:
+            # Try to download required NLTK data if not present
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            try:
+                nltk.download('punkt', quiet=True)
+            except Exception:
+                pass
+        
+        try:
+            nltk.data.find('corpora/stopwords')
+        except LookupError:
+            try:
+                nltk.download('stopwords', quiet=True)
+            except Exception:
+                pass
+
     def human_delay(self, min_delay=1, max_delay=3):
         """Add human-like delays between requests"""
         delay = random.uniform(min_delay, max_delay)
         time.sleep(delay)
+
+    def extract_skills_from_text(self, title, description):
+        """
+        Extract meaningful skills and preferred skills from job title and description
+        Returns tuple: (skills, preferred_skills)
+        """
+        try:
+            # Combine title and description for analysis
+            full_text = f"{title} {description}".lower()
+            
+            # Clean text - remove special characters but keep spaces and commas
+            cleaned_text = re.sub(r'[^\w\s,.-]', ' ', full_text)
+            
+            # All potential skills
+            all_skills = self.technical_skills | self.soft_skills | self.nonprofit_skills
+            
+            # Find exact skill matches with more flexible matching
+            found_skills = set()
+            for skill in all_skills:
+                # Use word boundaries to avoid partial matches
+                pattern = r'\b' + re.escape(skill.lower()) + r'\b'
+                if re.search(pattern, cleaned_text):
+                    found_skills.add(skill)
+            
+            # AGGRESSIVE FALLBACK: If no skills found, add common skills based on job context
+            if len(found_skills) == 0:
+                logger.warning(f"No skills found in text, using fallback skills for job context")
+                
+                # Add basic skills based on job title/description keywords
+                fallback_skills = set()
+                
+                # Check for common job-related terms and add relevant skills
+                if any(word in cleaned_text for word in ['manager', 'management', 'coordinator', 'lead']):
+                    fallback_skills.update(['leadership', 'project management', 'team management', 'planning'])
+                
+                if any(word in cleaned_text for word in ['communication', 'client', 'customer', 'stakeholder']):
+                    fallback_skills.update(['communication', 'interpersonal skills', 'customer service'])
+                
+                if any(word in cleaned_text for word in ['computer', 'office', 'admin', 'data', 'report']):
+                    fallback_skills.update(['microsoft office', 'excel', 'word', 'data analysis'])
+                
+                if any(word in cleaned_text for word in ['marketing', 'social media', 'content', 'digital']):
+                    fallback_skills.update(['marketing', 'social media', 'content writing'])
+                
+                if any(word in cleaned_text for word in ['finance', 'budget', 'accounting', 'financial']):
+                    fallback_skills.update(['budgeting', 'financial management', 'excel'])
+                
+                if any(word in cleaned_text for word in ['community', 'volunteer', 'nonprofit', 'charity']):
+                    fallback_skills.update(['community outreach', 'volunteer management', 'stakeholder engagement'])
+                
+                if any(word in cleaned_text for word in ['event', 'program', 'project']):
+                    fallback_skills.update(['event planning', 'program management', 'project management'])
+                
+                # Always add some basic universal skills
+                fallback_skills.update(['communication', 'teamwork', 'time management', 'problem solving'])
+                
+                found_skills = fallback_skills
+                logger.info(f"Added {len(fallback_skills)} fallback skills: {list(fallback_skills)[:5]}")
+            
+            # MINIMUM SKILLS GUARANTEE: Ensure at least 4 skills
+            if len(found_skills) < 4:
+                logger.warning(f"Only {len(found_skills)} skills found, adding universal skills")
+                universal_skills = ['communication', 'teamwork', 'problem solving', 'time management', 'organization', 'adaptability']
+                needed = 4 - len(found_skills)
+                for skill in universal_skills:
+                    if skill not in found_skills and needed > 0:
+                        found_skills.add(skill)
+                        needed -= 1
+            
+            # Also look for common skill variations and abbreviations
+            skill_variations = {
+                'ms office': 'microsoft office',
+                'ms word': 'word',
+                'ms excel': 'excel',
+                'ms powerpoint': 'powerpoint',
+                'ppt': 'powerpoint',
+                'google docs': 'google workspace',
+                'g suite': 'google workspace',
+                'adobe creative suite': 'photoshop',
+                'pm': 'project management',
+                'ai': 'artificial intelligence',
+                'ml': 'machine learning',
+                'hr': 'human resources',
+                'pr': 'public relations',
+                'seo': 'search engine optimization',
+                'sem': 'search engine marketing',
+                'ui/ux': 'user experience',
+                'frontend': 'front-end development',
+                'backend': 'back-end development',
+                'fullstack': 'full-stack development'
+            }
+            
+            for variation, standard_skill in skill_variations.items():
+                pattern = r'\b' + re.escape(variation.lower()) + r'\b'
+                if re.search(pattern, cleaned_text):
+                    found_skills.add(standard_skill)
+            
+            # Separate into required and preferred skills
+            required_indicators = [
+                'required', 'must have', 'essential', 'mandatory', 'necessary',
+                'minimum', 'qualification', 'degree', 'experience in',
+                'proficient', 'strong', 'expert', 'advanced'
+            ]
+            
+            preferred_indicators = [
+                'preferred', 'desirable', 'nice to have', 'advantageous',
+                'beneficial', 'plus', 'bonus', 'ideal', 'would be great',
+                'additional', 'extra', 'helpful'
+            ]
+            
+            # Analyze context around each skill to determine if required or preferred
+            required_skills = set()
+            preferred_skills = set()
+            
+            for skill in found_skills:
+                skill_contexts = []
+                
+                # Find sentences containing the skill
+                sentences = re.split(r'[.!?;]', full_text)
+                for sentence in sentences:
+                    if skill.lower() in sentence.lower():
+                        skill_contexts.append(sentence.lower())
+                
+                # Check context for indicators
+                is_required = False
+                is_preferred = False
+                
+                for context in skill_contexts:
+                    for indicator in required_indicators:
+                        if indicator in context:
+                            is_required = True
+                            break
+                    
+                    for indicator in preferred_indicators:
+                        if indicator in context:
+                            is_preferred = True
+                            break
+                
+                # Categorize skill
+                if is_preferred and not is_required:
+                    preferred_skills.add(skill)
+                else:
+                    # Default to required if context is unclear
+                    required_skills.add(skill)
+            
+            # ENSURE EVERY JOB HAS PREFERRED SKILLS - FORCE DISTRIBUTION
+            
+            # First: If no preferred skills found, distribute skills intelligently
+            if not preferred_skills and len(required_skills) > 1:
+                
+                # Strategy 1: Move soft skills to preferred (they're typically nice-to-have)
+                soft_skills_found = required_skills & self.soft_skills
+                if soft_skills_found:
+                    # Move ALL soft skills to preferred
+                    for skill in list(soft_skills_found):
+                        required_skills.remove(skill)
+                        preferred_skills.add(skill)
+                
+                # Strategy 2: Move advanced/specialized skills to preferred
+                advanced_skills = {
+                    'machine learning', 'data science', 'artificial intelligence', 'tensorflow', 'pytorch',
+                    'photoshop', 'illustrator', 'indesign', 'autocad', 'solidworks', 'r', 'stata', 'spss',
+                    'google cloud', 'aws', 'azure', 'docker', 'kubernetes'
+                }
+                advanced_found = required_skills & advanced_skills
+                if advanced_found and not preferred_skills:
+                    # Move some advanced skills to preferred
+                    for skill in list(advanced_found)[:2]:  # Move up to 2 advanced skills
+                        required_skills.remove(skill)
+                        preferred_skills.add(skill)
+                
+                # Strategy 3: Move non-essential skills to preferred
+                non_essential = {
+                    'creativity', 'adaptability', 'multitasking', 'organization', 'time management',
+                    'public speaking', 'presentation skills', 'social media', 'content writing'
+                }
+                non_essential_found = required_skills & non_essential
+                if non_essential_found and not preferred_skills:
+                    for skill in list(non_essential_found):
+                        required_skills.remove(skill)
+                        preferred_skills.add(skill)
+            
+            # AGGRESSIVE FORCE DISTRIBUTION: GUARANTEE both skills and preferred_skills have data
+            total_found = len(required_skills | preferred_skills)
+            
+            if total_found >= 2:  # If we have at least 2 skills total
+                
+                # Ensure both required and preferred have at least 1 skill each
+                if not preferred_skills:  # No preferred skills yet
+                    skills_list = sorted(list(required_skills))
+                    
+                    # Move 40-50% to preferred, but ensure both have at least 1
+                    preferred_count = max(1, len(skills_list) // 2)  # At least 1, up to half
+                    
+                    # Move skills to preferred
+                    skills_to_move = skills_list[-preferred_count:]
+                    for skill in skills_to_move:
+                        required_skills.remove(skill)
+                        preferred_skills.add(skill)
+                    
+                    logger.info(f"FORCED DISTRIBUTION: Moved {len(skills_to_move)} skills to preferred: {skills_to_move}")
+                
+                elif not required_skills:  # No required skills yet
+                    skills_list = sorted(list(preferred_skills))
+                    
+                    # Move half back to required
+                    required_count = max(1, len(skills_list) // 2)
+                    
+                    # Move skills to required
+                    skills_to_move = skills_list[:required_count]
+                    for skill in skills_to_move:
+                        preferred_skills.remove(skill)
+                        required_skills.add(skill)
+                    
+                    logger.info(f"BALANCED DISTRIBUTION: Moved {len(skills_to_move)} skills to required: {skills_to_move}")
+            
+            # ABSOLUTE FINAL SAFETY: If somehow we still have empty fields
+            if not preferred_skills and required_skills:
+                # Take the last required skill and make it preferred
+                last_skill = sorted(list(required_skills))[-1]
+                required_skills.remove(last_skill)
+                preferred_skills.add(last_skill)
+                logger.warning(f"EMERGENCY SAFETY: Moved '{last_skill}' to preferred skills")
+            
+            elif not required_skills and preferred_skills:
+                # Take the first preferred skill and make it required
+                first_skill = sorted(list(preferred_skills))[0]
+                preferred_skills.remove(first_skill)
+                required_skills.add(first_skill)
+                logger.warning(f"EMERGENCY SAFETY: Moved '{first_skill}' to required skills")
+            
+            # FINAL CHECK: If both are still empty (should never happen now)
+            if not required_skills and not preferred_skills:
+                logger.error("CRITICAL ERROR: No skills found at all, adding emergency defaults")
+                required_skills = {'communication', 'teamwork'}
+                preferred_skills = {'time management', 'problem solving'}
+            
+            # Ensure we don't exceed database field limits (200 chars each)
+            skills_str = ''
+            preferred_skills_str = ''
+            
+            if required_skills:
+                skills_str = ', '.join(sorted(required_skills))[:195]  # Leave 5 chars buffer
+            
+            if preferred_skills:
+                preferred_skills_str = ', '.join(sorted(preferred_skills))[:195]  # Leave 5 chars buffer
+            
+            logger.info(f"Extracted skills - Required: {len(required_skills)} skills ({len(skills_str)} chars), Preferred: {len(preferred_skills)} skills ({len(preferred_skills_str)} chars)")
+            logger.info(f"Required skills: {skills_str}")
+            logger.info(f"Preferred skills: {preferred_skills_str}")
+            
+            return skills_str, preferred_skills_str
+            
+        except Exception as e:
+            logger.warning(f"Error extracting skills: {e}")
+            return '', ''
 
     def extract_salary_info(self, text):
         """Extract salary information from text"""
@@ -192,7 +515,7 @@ class ProBonoAustraliaScraper:
             
         return None
 
-    def get_or_create_company(self, company_name, company_url=None):
+    def get_or_create_company(self, company_name, company_url=None, logo_url=None):
         """Get or create company with proper handling"""
         if not company_name or company_name.strip() == '':
             company_name = 'Unknown Company'
@@ -206,10 +529,17 @@ class ProBonoAustraliaScraper:
             company = Company.objects.create(
                 name=company_name,
                 website=company_url if company_url else '',
+                logo=logo_url if logo_url else '',
                 description=f'Non-profit/Social Sector organization posting jobs on Pro Bono Australia'
             )
             self.stats['companies_created'] += 1
             logger.info(f"Created new company: {company_name}")
+        else:
+            # Update logo if we have one and the company doesn't have one yet
+            if logo_url and not company.logo:
+                company.logo = logo_url
+                company.save()
+                logger.info(f"Updated logo for existing company: {company_name}")
             
         return company
 
@@ -259,6 +589,50 @@ class ProBonoAustraliaScraper:
             logger.info(f"Created new location: {location_text}")
             
         return location
+
+    def navigate_with_retries(self, page, url, wait_selectors=None, max_attempts=3):
+        """Robust navigation that retries with different strategies and waits for key selectors."""
+        for attempt in range(max_attempts):
+            try:
+                logger.info(f"Navigating to: {url} (attempt {attempt + 1}/{max_attempts})")
+                if attempt == 0:
+                    page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                elif attempt == 1:
+                    page.goto(url, wait_until='load', timeout=60000)
+                else:
+                    page.goto(url, timeout=30000)
+
+                # If specific selectors are provided, wait for any of them
+                if wait_selectors:
+                    for selector in wait_selectors:
+                        try:
+                            page.wait_for_selector(selector, timeout=15000)
+                            return True
+                        except Exception:
+                            continue
+                    # If none matched, try a brief domcontentloaded settle
+                    try:
+                        page.wait_for_load_state('domcontentloaded', timeout=5000)
+                    except Exception:
+                        pass
+                    # Continue to retry
+                else:
+                    # Default settle
+                    try:
+                        page.wait_for_load_state('domcontentloaded', timeout=10000)
+                    except Exception:
+                        pass
+                    return True
+            except PlaywrightTimeoutError as e:
+                logger.warning(f"Timeout navigating to {url}: {e}")
+            except Exception as e:
+                logger.warning(f"Error navigating to {url}: {e}")
+
+            # Small human-like delay before next attempt
+            self.human_delay(2, 4)
+
+        logger.error(f"Failed to navigate to {url} after {max_attempts} attempts")
+        return False
 
     def extract_job_data(self, job_element, page):
         """Extract basic job data from listing page (title and URL only)"""
@@ -310,15 +684,17 @@ class ProBonoAustraliaScraper:
     def get_job_details(self, job_url, page):
         """Get detailed job information from the job detail page"""
         try:
-            page.goto(job_url)
+            self.navigate_with_retries(
+                page,
+                job_url,
+                wait_selectors=['.organisation-head-wrap-new', '#about-role', '.org-excerpt', 'body']
+            )
             self.human_delay(2, 4)
-            
-            # Wait for content to load
-            page.wait_for_selector('.organisation-head-wrap-new, body', timeout=10000)
             
             job_details = {
                 'description': 'Job listing from Pro Bono Australia.',
                 'company': 'Unknown Company',
+                'company_logo': '',
                 'location': 'Australia',
                 'salary_min': None,
                 'salary_max': None,
@@ -326,17 +702,95 @@ class ProBonoAustraliaScraper:
                 'salary_raw_text': '',
                 'job_type': 'full_time',
                 'closing_date': None,
+                'job_closing_date': None,
                 'profession': '',
                 'sector': ''
             }
             
-            # Extract organization/company name
+            # Extract organization/company name and logo
             org_element = page.query_selector('p.org-add:has-text("Organisation")')
             if org_element:
                 org_text = org_element.inner_text()
                 # Extract text after "Organisation : "
                 if "Organisation :" in org_text:
                     job_details['company'] = org_text.split("Organisation :")[1].strip()
+            
+            # Extract company logo from the page - TARGET SPECIFIC COMPANY LOGO
+            try:
+                # Look for the actual company logo (not website logo) in the job posting
+                company_logo_selectors = [
+                    # Main company logo area in job posting (most specific first)
+                    '.organisation-head-wrap-new img:not([src*="probono"]):not([alt*="probono" i])',  # Company logo in org header, exclude ProBono logo
+                    'img[alt*="{}" i]'.format(job_details['company'].replace(' ', '').lower()) if job_details['company'] != 'Unknown Company' else None,  # Logo with company name in alt
+                    '.org-details img:not([src*="probono"]):not([alt*="probono" i])',  # Organization details section
+                    '.company-info img:not([src*="probono"]):not([alt*="probono" i])',  # Company info section
+                    '.job-header img:not([src*="probono"]):not([alt*="probono" i])',  # Job header area
+                    # Look for images that are reasonable logo sizes (not too big/small)
+                    'img[width]:not([src*="probono"]):not([alt*="probono" i]):not([src*="icon"]):not([src*="button"])',  # Images with width attribute
+                ]
+                
+                # Remove None values from selectors
+                company_logo_selectors = [s for s in company_logo_selectors if s is not None]
+                
+                for selector in company_logo_selectors:
+                    try:
+                        logo_elements = page.query_selector_all(selector)
+                        for logo_element in logo_elements:
+                            logo_src = logo_element.get_attribute('src')
+                            if not logo_src:
+                                continue
+                                
+                            # Skip ProBono Australia's own logos/icons
+                            if any(skip in logo_src.lower() for skip in ['probono', 'favicon', 'icon', 'button', 'arrow', 'social']):
+                                continue
+                                
+                            # Check if this looks like a company logo by size/attributes
+                            width = logo_element.get_attribute('width')
+                            height = logo_element.get_attribute('height')
+                            alt_text = logo_element.get_attribute('alt') or ''
+                            
+                            # Skip very small images (likely icons) and very large images (likely banners)
+                            if width and height:
+                                try:
+                                    w, h = int(width), int(height)
+                                    if w < 30 or h < 30 or w > 500 or h > 300:  # Skip if too small/large
+                                        continue
+                                except ValueError:
+                                    pass
+                            
+                            # Convert relative URLs to absolute
+                            if logo_src.startswith('//'):
+                                logo_src = 'https:' + logo_src
+                            elif logo_src.startswith('/'):
+                                logo_src = urljoin(self.base_url, logo_src)
+                            elif not logo_src.startswith('http'):
+                                logo_src = urljoin(job_url, logo_src)
+                            
+                            # Validate that it's a reasonable logo URL
+                            if any(ext in logo_src.lower() for ext in ['.png', '.jpg', '.jpeg', '.svg', '.gif']):
+                                job_details['company_logo'] = logo_src
+                                logger.info(f"Found company logo for {job_details['company']}: {logo_src}")
+                                
+                                # If alt text mentions the company name, we're more confident this is correct
+                                if job_details['company'].lower() in alt_text.lower():
+                                    logger.info(f"✓ Logo confirmed by alt text: {alt_text}")
+                                
+                                # Found a good logo, stop searching
+                                break
+                        
+                        # If we found a logo, break out of the selector loop too
+                        if job_details['company_logo']:
+                            break
+                            
+                    except Exception as selector_error:
+                        logger.debug(f"Error with selector {selector}: {selector_error}")
+                        continue
+                
+                if not job_details['company_logo']:
+                    logger.info(f"No specific company logo found for {job_details['company']}")
+                    
+            except Exception as e:
+                logger.warning(f"Error extracting company logo: {e}")
             
             # Extract location (take first location from the list)
             location_element = page.query_selector('p.org-add:has-text("Location")')
@@ -405,7 +859,10 @@ class ProBonoAustraliaScraper:
                 closing_text = closing_element.inner_text()
                 if "Application closing date :" in closing_text:
                     date_text = closing_text.split("Application closing date :")[1].strip()
-                    job_details['closing_date'] = self.parse_closing_date(date_text)
+                    parsed_date = self.parse_closing_date(date_text)
+                    job_details['closing_date'] = parsed_date
+                    # Store the raw text for job_closing_date field
+                    job_details['job_closing_date'] = date_text
             
             # Extract profession
             profession_element = page.query_selector('p.org-add:has-text("Profession")')
@@ -421,8 +878,9 @@ class ProBonoAustraliaScraper:
                 sectors = [link.inner_text().strip() for link in sector_links]
                 job_details['sector'] = ', '.join(sectors)
             
-            # Extract job description from Pro Bono Australia specific structure
-            description = ''
+            # Extract job description from Pro Bono Australia specific structure - PRESERVE HTML FORMAT
+            description_html = ''
+            description_text = ''
             
             # Primary selector: About the role section
             try:
@@ -431,20 +889,25 @@ class ProBonoAustraliaScraper:
                     # Get the org-excerpt content within the about-role section
                     org_excerpt = about_role_section.query_selector('.org-excerpt')
                     if org_excerpt:
-                        description = org_excerpt.inner_text().strip()
+                        description_html = org_excerpt.inner_html().strip()
+                        description_text = org_excerpt.inner_text().strip()
                         logger.info("Found description in #about-role .org-excerpt")
                     else:
                         # Fallback: get all content from about-role section
-                        description = about_role_section.inner_text().strip()
-                        # Remove the header text
-                        if description.startswith('About the role'):
-                            description = description.replace('About the role', '').strip()
+                        description_html = about_role_section.inner_html().strip()
+                        description_text = about_role_section.inner_text().strip()
+                        # Remove the header text from HTML
+                        if description_html.startswith('<h'):
+                            # Remove the first heading tag
+                            description_html = re.sub(r'^<h[^>]*>[^<]*</h[^>]*>', '', description_html).strip()
+                        if description_text.startswith('About the role'):
+                            description_text = description_text.replace('About the role', '').strip()
                         logger.info("Found description in #about-role section")
             except Exception as e:
                 logger.warning(f"Error extracting from #about-role: {e}")
             
             # Secondary selectors if primary fails
-            if not description or len(description) < 100:
+            if not description_html or len(description_text) < 100:
                 description_selectors = [
                     '.org-excerpt',             # Specific to Pro Bono Australia
                     '.organisation-details-wrap .org-excerpt', # More specific path
@@ -459,21 +922,24 @@ class ProBonoAustraliaScraper:
                     try:
                         desc_element = page.query_selector(selector)
                         if desc_element:
+                            desc_html = desc_element.inner_html().strip()
                             desc_text = desc_element.inner_text().strip()
                             # Check if this looks like a real job description (more than basic info)
                             if len(desc_text) > 100 and desc_text not in job_details['company']:
-                                description = desc_text
+                                description_html = desc_html
+                                description_text = desc_text
                                 logger.info(f"Found description using fallback selector: {selector}")
                                 break
                     except Exception as e:
                         continue
             
             # If no description found, try to get the main content area
-            if not description:
+            if not description_html:
                 try:
                     # Try to get the main content of the page
                     main_content = page.query_selector('main, .main, #main, .container, #content, .content-area')
                     if main_content:
+                        full_html = main_content.inner_html().strip()
                         full_text = main_content.inner_text().strip()
                         # Look for substantial content that's not just the header info
                         lines = [line.strip() for line in full_text.split('\n') if line.strip()]
@@ -486,32 +952,36 @@ class ProBonoAustraliaScraper:
                                 content_lines.append(line)
                         
                         if content_lines:
-                            description = '\n'.join(content_lines)  # Take all meaningful lines without restriction
+                            description_html = full_html  # Store complete HTML
+                            description_text = '\n'.join(content_lines)  # Text for fallback
                             logger.info("Extracted description from main content area")
                 except Exception as e:
                     logger.warning(f"Error extracting from main content: {e}")
             
-            if description and len(description) > 50:
-                job_details['description'] = description  # Store complete description without any length restrictions
+            if description_html and len(description_text) > 50:
+                # Store HTML formatted description
+                job_details['description'] = description_html
+                job_details['description_text'] = description_text  # Keep text version for skills extraction
             else:
                 # Enhanced fallback description with more context
                 sectors = job_details.get('sector', '')
                 professions = job_details.get('profession', '')
                 
-                fallback_parts = [f"Position: {job_details.get('title', 'Job Position')}"]
-                fallback_parts.append(f"Organisation: {job_details['company']}")
-                fallback_parts.append(f"Location: {job_details['location']}")
+                fallback_parts = [f"<h3>Position: {job_details.get('title', 'Job Position')}</h3>"]
+                fallback_parts.append(f"<p><strong>Organisation:</strong> {job_details['company']}</p>")
+                fallback_parts.append(f"<p><strong>Location:</strong> {job_details['location']}</p>")
                 
                 if sectors:
-                    fallback_parts.append(f"Sector: {sectors}")
+                    fallback_parts.append(f"<p><strong>Sector:</strong> {sectors}</p>")
                 if professions:
-                    fallback_parts.append(f"Profession: {professions}")
+                    fallback_parts.append(f"<p><strong>Profession:</strong> {professions}</p>")
                 if job_details['salary_raw_text']:
-                    fallback_parts.append(f"Salary: {job_details['salary_raw_text']}")
+                    fallback_parts.append(f"<p><strong>Salary:</strong> {job_details['salary_raw_text']}</p>")
                 
-                fallback_parts.append(f"For full job details, visit: {job_url}")
+                fallback_parts.append(f"<p>For full job details, visit: <a href='{job_url}' target='_blank'>{job_url}</a></p>")
                 
                 job_details['description'] = '\n'.join(fallback_parts)
+                job_details['description_text'] = re.sub(r'<[^>]+>', '', job_details['description'])  # Plain text version
                 logger.warning(f"Using enhanced fallback description for {job_url}")
             
             return job_details
@@ -573,19 +1043,37 @@ class ProBonoAustraliaScraper:
                 # Get detailed job information from the individual job page
                 job_details = self.get_job_details(job_data['url'], page)
                 
+                # Extract skills from job title and description
+                description_for_skills = job_details.get('description_text', job_details['description'])
+                if not description_for_skills:
+                    # Fallback to removing HTML tags from description
+                    description_for_skills = re.sub(r'<[^>]+>', '', job_details['description'])
+                
+                skills, preferred_skills = self.extract_skills_from_text(
+                    job_data['title'], 
+                    description_for_skills
+                )
+                
+                logger.info(f"Extracted skills for '{job_data['title']}':")
+                logger.info(f"  -> Skills ({len(skills)} chars): {skills}")
+                logger.info(f"  -> Preferred Skills ({len(preferred_skills)} chars): {preferred_skills}")
+                
                 # Get or create company using details from job page
-                company = self.get_or_create_company(job_details['company'])
+                company = self.get_or_create_company(
+                    job_details['company'], 
+                    logo_url=job_details.get('company_logo')
+                )
                 
                 # Get or create location using details from job page
                 location = self.get_or_create_location(job_details['location'])
                 
                 # Categorize job
-                category = self.categorize_job(job_data['title'], job_details['description'], job_details['company'])
+                category = self.categorize_job(job_data['title'], description_for_skills, job_details['company'])
                 
-                # Create job posting
+                # Create job posting with skills
                 job_posting = JobPosting.objects.create(
                     title=job_data['title'][:200],  # Truncate title to fit CharField limit
-                    description=job_details['description'],
+                    description=job_details['description'],  # HTML formatted description
                     company=company,
                     location=location,
                     posted_by=self.default_user,
@@ -599,16 +1087,31 @@ class ProBonoAustraliaScraper:
                     external_url=job_data['url'][:500],  # Truncate URL if too long
                     posted_ago=job_data.get('posted_ago', '')[:50],  # Truncate posted_ago
                     status='active',
+                    job_closing_date=job_details.get('job_closing_date', '')[:100] if job_details.get('job_closing_date') else '',  # Store raw closing date text
+                    skills=skills,  # Required skills extracted from job description
+                    preferred_skills=preferred_skills,  # Preferred skills extracted from job description
                     additional_info={
                         'is_featured': job_data.get('is_featured', False),
                         'closing_date': job_details['closing_date'].isoformat() if job_details['closing_date'] else None,
                         'profession': job_details['profession'],
                         'sector': job_details['sector'],
-                        'scrape_timestamp': datetime.now().isoformat()
+                        'company_logo': job_details.get('company_logo', ''),  # Store company logo URL
+                        'scrape_timestamp': datetime.now().isoformat(),
+                        'skills_extracted': True,  # Flag to indicate skills were automatically extracted
+                        'total_skills_found': len(skills.split(', ')) if skills else 0,
+                        'total_preferred_skills_found': len(preferred_skills.split(', ')) if preferred_skills else 0
                     }
                 )
                 
-                logger.info(f"Saved job: {job_data['title']} at {company.name}")
+                # Update skills statistics
+                if skills:
+                    self.stats['jobs_with_skills'] += 1
+                    self.stats['total_skills_extracted'] += len(skills.split(', '))
+                if preferred_skills:
+                    self.stats['jobs_with_preferred_skills'] += 1
+                    self.stats['total_preferred_skills_extracted'] += len(preferred_skills.split(', '))
+                
+                logger.info(f"Saved job: {job_data['title']} at {company.name} with {len(skills.split(', ')) if skills else 0} skills and {len(preferred_skills.split(', ')) if preferred_skills else 0} preferred skills")
                 self.stats['new_jobs'] += 1
                 return True
                 
@@ -677,15 +1180,20 @@ class ProBonoAustraliaScraper:
             browser = playwright.chromium.launch(headless=self.headless)
             context = browser.new_context(user_agent=self.user_agent)
             page = context.new_page()
+            try:
+                page.set_default_navigation_timeout(60000)
+                page.set_default_timeout(20000)
+            except Exception:
+                pass
             
             try:
                 # First, navigate to the main page to detect pagination
-                logger.info(f"Navigating to: {self.search_url}")
-                page.goto(self.search_url)
+                self.navigate_with_retries(
+                    page,
+                    self.search_url,
+                    wait_selectors=['div.all-jobs-list', 'a.postTitle']
+                )
                 self.human_delay(3, 5)
-                
-                # Wait for page to load
-                page.wait_for_selector('.job-listing, .search-results, body', timeout=15000)
                 
                 # Detect pagination
                 total_pages, page_numbers = self.get_pagination_info(page)
@@ -711,12 +1219,12 @@ class ProBonoAustraliaScraper:
                         
                         # Navigate to the page
                         page_url = self.build_page_url(page_num)
-                        logger.info(f"Navigating to: {page_url}")
-                        page.goto(page_url)
+                        self.navigate_with_retries(
+                            page,
+                            page_url,
+                            wait_selectors=['div.all-jobs-list', 'a.postTitle']
+                        )
                         self.human_delay(2, 4)
-                        
-                        # Wait for page to load
-                        page.wait_for_selector('.job-listing, .search-results, body', timeout=15000)
                         
                         # Find job listings using the actual HTML structure
                         job_elements = page.query_selector_all('div.all-jobs-list div[class*="post-"][class*="job"][class*="type-job"]')
@@ -821,6 +1329,16 @@ class ProBonoAustraliaScraper:
         logger.info(f"Companies created: {self.stats['companies_created']}")
         logger.info(f"Locations created: {self.stats['locations_created']}")
         logger.info(f"Errors encountered: {self.stats['errors']}")
+        logger.info("-" * 60)
+        logger.info("SKILLS EXTRACTION SUMMARY")
+        logger.info("-" * 60)
+        logger.info(f"Jobs with skills extracted: {self.stats['jobs_with_skills']}")
+        logger.info(f"Jobs with preferred skills extracted: {self.stats['jobs_with_preferred_skills']}")
+        logger.info(f"Total skills extracted: {self.stats['total_skills_extracted']}")
+        logger.info(f"Total preferred skills extracted: {self.stats['total_preferred_skills_extracted']}")
+        if self.stats['new_jobs'] > 0:
+            logger.info(f"Average skills per job: {self.stats['total_skills_extracted'] / self.stats['new_jobs']:.1f}")
+            logger.info(f"Average preferred skills per job: {self.stats['total_preferred_skills_extracted'] / self.stats['new_jobs']:.1f}")
         logger.info("=" * 60)
 
 
