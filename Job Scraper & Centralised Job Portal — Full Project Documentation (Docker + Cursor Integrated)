@@ -1,0 +1,395 @@
+# 🧩 Job Scraper & Centralised Job Portal — Full Project Documentation (Docker + Cursor Integrated)
+
+**Project Name:** Evol Job Scraper Portal
+**Maintainer:** Salman Pahadi
+**Database:** PostgreSQL
+**Runtime:** Dockerised FastAPI + Python ETL
+**Purpose:** Automate job scraping, anonymise employer data, enrich job records with skill intelligence, and manage ETL execution securely.
+
+---
+
+## 1. 🔍 Overview
+
+This system automates job aggregation across 40–50 Australian job sites using Selenium-based scrapers.
+The pipeline stores raw jobs, cleans and anonymises them, adds inferred data such as salary bands and skills, and exposes anonymised listings in a centralised portal.
+
+Key features:
+
+* Automated ETL pipeline with manual trigger
+* Employer privacy and data separation
+* Smart skill detection and auto-learning
+* Daily summary logging
+* FastAPI admin endpoint for manual control
+* Full Docker environment (ETL + API + PostgreSQL)
+
+---
+
+## 2. ⚙️ Architecture Flow
+
+```
+[ Selenium Scrapers ]
+        ↓
+  ┌──────────────────────┐
+  │   staging_jobs (raw) │
+  └──────────────────────┘
+        ↓
+       ETL
+        ↓
+  ┌──────────────┬────────────────────┐
+  │ vault_jobs    │ portal_jobs        │
+  │ (sensitive)   │ (anonymised data)  │
+  └──────────────┴────────────────────┘
+        ↓
+  [ skill_master + summary + API ]
+```
+
+---
+
+## 3. 🧱 Database Schema
+
+Database: **PostgreSQL (Docker container)**
+
+### Key Tables
+
+#### `staging_jobs`
+
+Stores raw scraped payloads before cleaning.
+
+```sql
+CREATE TABLE staging_jobs (
+  id SERIAL PRIMARY KEY,
+  source_site VARCHAR(255),
+  source_url TEXT,
+  raw_json JSONB,
+  scraped_at TIMESTAMP DEFAULT NOW(),
+  processed BOOLEAN DEFAULT FALSE
+);
+```
+
+#### `vault_jobs`
+
+Encrypted employer data for internal use.
+
+```sql
+CREATE TABLE vault_jobs (
+  job_id UUID PRIMARY KEY,
+  company_name TEXT,
+  contact_email TEXT,
+  contact_phone TEXT,
+  company_website TEXT,
+  raw_description TEXT,
+  raw_payload JSONB,
+  created_at TIMESTAMP DEFAULT NOW(),
+  encrypted BOOLEAN DEFAULT TRUE
+);
+```
+
+#### `portal_jobs`
+
+Public anonymised listings for the portal.
+
+```sql
+CREATE TABLE portal_jobs (
+  job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title TEXT NOT NULL,
+  description TEXT,
+  location TEXT,
+  employment_type VARCHAR(100),
+  salary_band VARCHAR(50),
+  category VARCHAR(100),
+  required_skills TEXT[],
+  preferred_skills TEXT[],
+  tags TEXT[],
+  experience_level VARCHAR(100),
+  posted_date DATE,
+  source_site VARCHAR(100),
+  source_url TEXT,
+  hash_key VARCHAR(64) UNIQUE,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### `skill_master`
+
+Dynamic skills dictionary.
+
+```sql
+CREATE TABLE skill_master (
+  id SERIAL PRIMARY KEY,
+  skill_name TEXT UNIQUE,
+  category TEXT,
+  skill_type VARCHAR(20),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### `job_ingestion_summary`
+
+Tracks daily ETL metrics.
+
+```sql
+CREATE TABLE job_ingestion_summary (
+  id SERIAL PRIMARY KEY,
+  summary_date DATE UNIQUE DEFAULT CURRENT_DATE,
+  total_scraped INT DEFAULT 0,
+  total_processed INT DEFAULT 0,
+  total_duplicates INT DEFAULT 0,
+  total_errors INT DEFAULT 0,
+  new_skills_added INT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### `api_admin_tokens`
+
+Secure admin access for ETL API.
+
+```sql
+CREATE TABLE api_admin_tokens (
+  id SERIAL PRIMARY KEY,
+  token VARCHAR(255) UNIQUE NOT NULL,
+  owner VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+---
+
+## 4. 🧠 ETL Process Summary
+
+**Script:** `/etl/etl_jobs.py`
+
+Responsibilities:
+
+* Reads unprocessed `staging_jobs`
+* Cleans & anonymises job text
+* Derives `required_skills`, `preferred_skills`, and `salary_band`
+* Inserts into `vault_jobs` (sensitive) and `portal_jobs` (anonymised)
+* Auto-learns new skills into `skill_master`
+* Updates daily summary
+
+ETL is modular and transaction-safe — every error is logged and rolled back without interrupting subsequent jobs.
+
+---
+
+## 5. 🧾 Daily Job Summary
+
+**Script:** `/etl/daily_summary.py`
+
+Stores daily ingestion metrics into `job_ingestion_summary` and prints a clear log summary.
+
+Example log:
+
+```
+===== DAILY JOB SUMMARY =====
+Date: 2025-11-12
+Total scraped:     142
+Total processed:   128
+Duplicates skipped:9
+Errors:            5
+New skills added:  3
+==============================
+```
+
+---
+
+## 6. 🚀 FastAPI Admin Endpoint
+
+**File:** `/etl/api/etl_api.py`
+
+Provides manual ETL trigger control via:
+
+```
+POST /admin/etl/run
+Header: x-api-key: YOUR_SECRET_ETL_TOKEN
+```
+
+**Response Example**
+
+```json
+{
+  "status": "success",
+  "message": "ETL process executed successfully.",
+  "stats": {
+    "total_scraped": 142,
+    "total_processed": 128,
+    "total_duplicates": 9,
+    "total_errors": 5,
+    "new_skills_added": 3
+  },
+  "executed_at": "2025-11-12T14:31:52.982392"
+}
+```
+
+Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+---
+
+## 7. 🐳 Docker Setup
+
+### **docker-compose.yml**
+
+```yaml
+version: "3.9"
+services:
+  db:
+    image: postgres:15
+    container_name: jobportal_db
+    restart: always
+    environment:
+      POSTGRES_DB: evol_jobs
+      POSTGRES_USER: evol_admin
+      POSTGRES_PASSWORD: yourpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  etl:
+    build: .
+    container_name: jobportal_etl
+    command: ["python", "etl/etl_jobs.py"]
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+
+  api:
+    build: .
+    container_name: jobportal_api
+    command: ["uvicorn", "etl.api.etl_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=db
+      - DB_NAME=evol_jobs
+      - DB_USER=evol_admin
+      - DB_PASSWORD=yourpassword
+    depends_on:
+      - db
+      - etl
+
+volumes:
+  db_data:
+```
+
+### **Dockerfile**
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "etl/etl_jobs.py"]
+```
+
+### **requirements.txt**
+
+```
+fastapi
+uvicorn
+psycopg2-binary
+pydantic
+python-dotenv
+```
+
+### **Run Commands**
+
+```bash
+docker-compose build
+docker-compose up -d
+```
+
+---
+
+## 8. 🧩 Folder Structure
+
+```
+/etl/
+   ├── etl_jobs.py
+   ├── daily_summary.py
+   ├── api/
+   │    └── etl_api.py
+   ├── utils/
+   │    ├── text_cleaner.py
+   │    ├── skill_extractor.py
+   │    └── logger.py
+/docker/
+   ├── Dockerfile
+   └── docker-compose.yml
+/docs/
+   └── etl_project_guide.md
+```
+
+---
+
+## 9. 🧮 Cursor Automation Prompt
+
+Add this inside `.cursorrules` or `/docs/cursor_instructions.md`.
+
+```
+You are an experienced backend engineer maintaining a Dockerised FastAPI + ETL project.
+
+Objective: scan the repository, detect missing or incomplete modules, and auto-develop those components according to the following architecture.
+
+Expected:
+- Dockerised environment with PostgreSQL, ETL, and API services.
+- ETL script reading from staging_jobs and populating vault_jobs + portal_jobs.
+- Skill extraction and auto-learning logic.
+- Daily job summary logger.
+- FastAPI endpoint for manual ETL trigger with API token security.
+
+Tasks:
+1. Inspect the repo for missing or weak components.
+2. If missing:
+   - Generate PostgreSQL models.
+   - Add missing scripts, utilities, or migrations.
+   - Fix Docker service dependencies.
+   - Add or update FastAPI endpoints.
+3. Verify that all database tables and indexes match the documentation.
+4. Ensure compatibility with Docker Compose networking (service name = db).
+5. Log all auto-generated changes and produce a Markdown summary:
+   - Missing modules fixed
+   - Weak logic improved
+   - Docker or environment configs validated
+
+Deliverable:
+- Updated, running Dockerised ETL system with full compliance to this architecture.
+```
+
+---
+
+## 10. ✅ Maintenance & CI/CD Hooks
+
+* Schedule daily ETL via cron inside the ETL container:
+
+  ```bash
+  docker exec jobportal_etl bash -c "python /app/etl/etl_jobs.py"
+  ```
+* Log output to `/var/log/etl_jobs.log` (volume-mounted)
+* Run tests before deploy:
+
+  ```bash
+  docker-compose exec api pytest
+  ```
+* Optional GitHub Actions workflow can auto-rebuild containers if any ETL or API changes are pushed.
+
+---
+
+## 11. 🧾 Next Step for You
+
+* Place this file at `/docs/etl_project_guide.md`
+* Add `.cursorrules` using the prompt above
+* Run Cursor’s **“/analyze project”** command — it’ll scan for missing pieces (models, scripts, configs)
+* Cursor will automatically generate or repair them inline
+
+---
+
+Would you like me to now create the `.cursorrules` file itself — the actual JSON-ready configuration that you can drop directly into your project root for Cursor automation? It’ll make your repo self-aware of all these architectural rules.

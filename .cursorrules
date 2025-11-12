@@ -1,0 +1,106 @@
+{
+  "name": "Evol Job Scraper Portal",
+  "description": "Dockerised ETL and FastAPI system for automated job scraping, anonymisation, enrichment, and centralised storage.",
+  "version": "1.0",
+  "language": "python",
+  "project_structure": {
+    "core": [
+      "etl/etl_jobs.py",
+      "etl/daily_summary.py",
+      "etl/api/etl_api.py",
+      "etl/utils/",
+      "docker/Dockerfile",
+      "docker/docker-compose.yml",
+      "docs/etl_project_guide.md"
+    ],
+    "database": ["staging_jobs", "vault_jobs", "portal_jobs", "skill_master", "job_ingestion_summary", "api_admin_tokens"],
+    "dependencies": ["fastapi", "uvicorn", "psycopg2-binary", "pydantic", "python-dotenv"]
+  },
+  "goals": [
+    "Scan repository for missing or incomplete Python modules or weak implementations related to ETL, API, or Docker setup.",
+    "Verify PostgreSQL schema and table consistency with etl_project_guide.md.",
+    "Ensure all required modules exist and follow standard folder layout under /etl.",
+    "Detect and rebuild incomplete utility modules (logger, skill extractor, text cleaner).",
+    "Validate Docker Compose configuration and environment variable linking between db, api, and etl containers.",
+    "Ensure FastAPI admin endpoint (/admin/etl/run) is implemented, secured via API key, and integrated with ETL execution.",
+    "Confirm that daily summary logger writes accurate metrics to job_ingestion_summary.",
+    "Add missing indexes, unique constraints, or SQL migrations automatically when needed."
+  ],
+  "tasks": [
+    {
+      "name": "Scan Repository",
+      "description": "Review all ETL, API, and utils scripts. Identify missing or incomplete modules, functions, or weak points.",
+      "actions": [
+        "Inspect /etl/ for etl_jobs.py, daily_summary.py, and api/etl_api.py.",
+        "Check for missing imports or undefined functions.",
+        "Detect if any core database interactions (INSERT, UPDATE) are incomplete or lack transaction safety."
+      ]
+    },
+    {
+      "name": "Auto Develop Missing Components",
+      "description": "Regenerate or patch incomplete modules according to the project architecture.",
+      "actions": [
+        "If etl_jobs.py missing — rebuild full ETL logic (staging -> vault -> portal).",
+        "If daily_summary.py missing — create summary logger for job_ingestion_summary.",
+        "If etl/api/etl_api.py missing — create FastAPI endpoint for manual ETL trigger using API key validation.",
+        "If utils missing — generate text_cleaner.py, skill_extractor.py, and logger.py with modular reusable methods.",
+        "If Docker files missing or incomplete — reconstruct Dockerfile and docker-compose.yml with db, etl, api services."
+      ]
+    },
+    {
+      "name": "Validate Database Integration",
+      "description": "Ensure PostgreSQL connections are used correctly with psycopg2 and that all table definitions exist.",
+      "actions": [
+        "Cross-check SQL CREATE TABLE statements from etl_project_guide.md with migrations or model definitions.",
+        "Add missing GIN indexes for text and array fields.",
+        "Add hash_key UNIQUE constraint in portal_jobs if missing."
+      ]
+    },
+    {
+      "name": "Validate Docker Environment",
+      "description": "Ensure Docker Compose correctly links db, api, and etl containers and environment variables are set.",
+      "actions": [
+        "Verify database service (db) name matches DB_HOST in environment.",
+        "Ensure all images build and run cleanly.",
+        "If missing, add .env.sample for environment configuration."
+      ]
+    },
+    {
+      "name": "Generate Developer Summary",
+      "description": "After completion, produce a Markdown report summarising what was fixed or added.",
+      "actions": [
+        "List all files modified or generated.",
+        "Summarise added functions or schema changes.",
+        "Highlight performance or structural improvements."
+      ]
+    }
+  ],
+  "validation": {
+    "style": {
+      "language_version": "Python 3.11+",
+      "frameworks": ["FastAPI", "psycopg2"],
+      "coding_standards": [
+        "PEP8 compliance",
+        "Function docstrings required",
+        "Logging instead of print statements",
+        "Use environment variables for credentials",
+        "Modular reusable design under /etl"
+      ]
+    },
+    "docker": {
+      "enabled": true,
+      "required_services": ["db", "api", "etl"],
+      "check_links": true,
+      "env_required": ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    },
+    "security": {
+      "api_key_auth": true,
+      "sensitive_data_encryption": true,
+      "vault_isolation": true
+    }
+  },
+  "report_format": {
+    "type": "markdown",
+    "sections": ["Overview", "Detected Gaps", "Fixes Implemented", "New Files Created", "Schema Validation", "Docker Validation"]
+  }
+}
