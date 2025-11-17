@@ -1,23 +1,47 @@
 #!/usr/bin/env python
 """
-Professional MiningCareers.com.au Job Scraper using Playwright - FIXED VERSION
+Professional MiningCareers.com.au Job Scraper using Playwright with ETL Pipeline
+================================================================================
 
-This script scrapes job listings from miningcareers.com.au using a robust approach
-that handles Django async context and element navigation issues.
+Advanced Playwright-based scraper for MiningCareers.com.au that integrates with 
+your existing seek_scraper_project ETL pipeline:
 
-Features:
-- Fixed Django async context handling
-- Robust element extraction before navigation
-- Professional database structure integration
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
+- Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
+- Professional database structure (JobPosting, Company, Location)
 - Mining-specific job categorization
 - Human-like behavior to avoid detection
 - Complete pagination handling
+- ETL-ready data saved to StagingJob table
 
 Usage:
-    python miningcareers_australia_scraper_fixed.py [max_jobs]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python miningcareers_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python miningcareers_australia_scraper.py 100 --auto-etl       # Scrape 100 + auto ETL
+    
+    # Two-step manual process
+    python miningcareers_australia_scraper.py 100                  # Scrape only
+    python manage.py run_etl_pipeline --source=miningcareers.com.au  # Then run ETL
+    
+    # Other options
+    python miningcareers_australia_scraper.py 100 --reset          # Clear staging first
+    python miningcareers_australia_scraper.py                      # Scrape all jobs
 
-Example:
-    python miningcareers_australia_scraper_fixed.py 100
+Examples:
+    python miningcareers_australia_scraper.py 100 --auto-etl    # Scrape 100 jobs + ETL
+    python miningcareers_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python miningcareers_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -32,6 +56,7 @@ import logging
 from decimal import Decimal
 import threading
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
 # Set up Django environment BEFORE any Django imports
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'australia_job_scraper.settings_dev')
@@ -50,6 +75,8 @@ from playwright.sync_api import sync_playwright
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.models import JobPosting
+from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -82,6 +109,12 @@ class MiningCareersJobScraper:
         self.jobs_url = f"{self.base_url}/jobs/"
         self.scraped_jobs = []
         self.processed_urls = set()
+        
+        # Tracking variables for ETL flow
+        self.jobs_scraped = 0
+        self.jobs_saved = 0
+        self.duplicates_found = 0
+        self.errors_count = 0
         
         # Mining-specific job categories
         self.mining_categories = {
@@ -487,47 +520,15 @@ class MiningCareersJobScraper:
                 if line_skills and any(keyword in line_lower for keyword in ['experience', 'knowledge', 'understanding', 'familiarity']):
                     extracted_preferred_skills.extend(line_skills)
         
-        # CAPTURE ALL SKILLS - NO LIMITS - AS REQUESTED BY USER
         # Remove duplicates but keep ALL skills
         extracted_skills = list(dict.fromkeys(extracted_skills))  # Preserve order
         extracted_preferred_skills = list(dict.fromkeys(extracted_preferred_skills))
         
-        # USER WANTS ALL SKILLS IN BOTH FIELDS - DO NOT REMOVE DUPLICATES BETWEEN FIELDS
-        # If preferred skills is empty, copy ALL skills to preferred skills as backup
-        if not extracted_preferred_skills:
-            extracted_preferred_skills = extracted_skills.copy()
-        
-        # FORCE POPULATE PREFERRED SKILLS - USER DEMANDS BOTH FIELDS HAVE DATA
-        # If preferred skills is still small, intelligently add based on job content
-        if len(extracted_preferred_skills) < 10:
-            # Analyze description for common preferred skill indicators
-            preferred_indicators = {
-                'experience': ['5+ Years Experience', '10+ Years Experience', 'Mining Experience'],
-                'education': ['Engineering Degree', 'Trade Qualification', 'Geology Degree'],
-                'soft skills': ['Communication', 'Teamwork', 'Leadership', 'Problem Solving'],
-                'safety': ['Safety Management', 'Risk Assessment', 'HSE', 'First Aid'],
-                'technical': ['SAP', 'Excel', 'AutoCAD', 'Maintenance', 'Fleet Management']
-            }
-            
-            for category, skills in preferred_indicators.items():
-                for skill in skills:
-                    if any(keyword in description_lower for keyword in skill.lower().split()) and skill not in extracted_preferred_skills:
-                        extracted_preferred_skills.append(skill)
-        
-        # FINAL GUARANTEE - ALWAYS HAVE PREFERRED SKILLS DATA
-        if len(extracted_preferred_skills) < 5:
-            # Copy top skills from main skills to preferred
-            for skill in extracted_skills[:15]:
-                if skill not in extracted_preferred_skills:
-                    extracted_preferred_skills.append(skill)
-                if len(extracted_preferred_skills) >= 15:
-                    break
-        
-        # ABSOLUTE GUARANTEE - FORCE SKILLS IF STILL EMPTY
+        # If no skills found at all, add intelligent defaults based on description/title
         if len(extracted_skills) < 3:
             # Force add basic mining skills based on description content
             force_skills = []
-            title_desc_lower = description.lower()  # Only use description since job_data is not available here
+            title_desc_lower = (description + ' ' + job_title).lower()
             
             if any(word in title_desc_lower for word in ['manager', 'supervisor', 'superintendent']):
                 force_skills.extend(['Leadership', 'Management', 'Supervision', 'Team Management'])
@@ -542,26 +543,68 @@ class MiningCareersJobScraper:
             if any(word in title_desc_lower for word in ['control', 'systems', 'automation']):
                 force_skills.extend(['Control Systems', 'Automation', 'SCADA'])
             
-            # Add generic mining skills
-            force_skills.extend(['Communication', 'Teamwork', 'Mining Experience', 'Operations'])
+            # Add generic mining skills if still empty
+            if not force_skills:
+                force_skills.extend(['Communication', 'Teamwork', 'Mining Experience', 'Operations'])
             
             extracted_skills.extend(force_skills)
             extracted_skills = list(dict.fromkeys(extracted_skills))  # Remove duplicates
         
-        # FORCE PREFERRED SKILLS IF STILL EMPTY
-        if len(extracted_preferred_skills) < 3:
-            # Add experience-based preferred skills
-            preferred_force = ['1+ Years Experience', '10+ Years Experience', 'Mining Experience', 
-                             'Leadership', 'Communication', 'Problem Solving', 'Teamwork',
-                             'Safety Management', 'Technical Skills', 'Project Management']
-            extracted_preferred_skills.extend(preferred_force)
-            extracted_preferred_skills = list(dict.fromkeys(extracted_preferred_skills))
+        # GUARANTEE: Ensure we have enough skills to split properly (minimum 8 total)
+        if len(extracted_skills) < 8:
+            # Add common mining skills to reach minimum
+            fallback_skills = [
+                'Communication', 'Teamwork', 'Leadership', 'Problem Solving', 
+                'Safety Management', 'Mining Experience', 'Technical Skills', 'Operations',
+                'Time Management', 'Attention To Detail', 'Equipment Operation', 'Maintenance'
+            ]
+            for skill in fallback_skills:
+                if skill not in extracted_skills and len(extracted_skills) < 12:
+                    extracted_skills.append(skill)
         
-        # NO LIMITS - CAPTURE EVERYTHING AS USER REQUESTED
+        # SPLIT into two groups: skills and preferred_skills (aim for 4-6 each)
+        total_skills = len(extracted_skills)
+        mid_point = total_skills // 2
+        
+        # Ensure each gets at least 4 items
+        if mid_point < 4:
+            mid_point = min(4, total_skills)
+        
+        # Split the skills
+        skills_list = extracted_skills[:mid_point]
+        preferred_list = extracted_skills[mid_point:]
+        
+        # GUARANTEE: Both must have at least 4 items
+        if len(skills_list) < 4:
+            # Add more items to reach 4
+            while len(skills_list) < 4 and len(extracted_skills) >= 4:
+                skills_list = extracted_skills[:4]
+                preferred_list = extracted_skills[4:]
+                break
+        
+        if len(preferred_list) < 4:
+            # If preferred is too short, duplicate some skills from skills_list
+            extra_needed = 4 - len(preferred_list)
+            for i in range(extra_needed):
+                if i < len(skills_list):
+                    preferred_list.append(skills_list[i])
+        
+        # LIMIT: Cap at 6 items each for clean display (but keep more if naturally extracted)
+        # Don't artificially limit if we naturally found more skills
+        if len(skills_list) > 10:
+            skills_list = skills_list[:10]
+        if len(preferred_list) > 10:
+            preferred_list = preferred_list[:10]
+        
+        # FINAL FALLBACK: Ensure both have at least 4 items
+        if len(skills_list) < 4:
+            skills_list = ['Communication', 'Teamwork', 'Problem Solving', 'Mining Experience']
+        if len(preferred_list) < 4:
+            preferred_list = ['Leadership', 'Safety Management', 'Technical Skills', 'Operations']
         
         return {
-            'skills': extracted_skills,
-            'preferred_skills': extracted_preferred_skills
+            'skills': skills_list,
+            'preferred_skills': preferred_list
         }
     
     def _extract_salary_info(self, salary_text):
@@ -1460,121 +1503,146 @@ class MiningCareersJobScraper:
         
         return None
     
+    def save_job_to_database(self, job_data):
+        """Save job to database using thread to avoid async context issues."""
+        def run_in_thread():
+            return self._save_job_to_database_sync(job_data)
+        
+        # Use ThreadPoolExecutor to run database operation in separate thread
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_in_thread)
+            return future.result()
+    
     def _save_job_to_database_sync(self, job_data):
         """
-        Save job data to database in a separate thread to avoid async context issues.
+        Save job data to StagingJob for ETL processing (synchronous version for thread execution).
         
         Args:
             job_data (dict): Job information dictionary
             
         Returns:
-            bool: Success status
+            bool or str: Success status (True, False, or "duplicate")
         """
-        def save_job():
-            try:
-                # Close any existing connections
-                connections.close_all()
-                
-                with transaction.atomic():
-                    # Get or create company
-                    company = self._get_or_create_company(
-                        job_data['company_name'],
-                        job_data.get('company_logo', '')
-                    )
-                    
-                    # Get or create location
-                    location = self._get_or_create_location(job_data['location'])
-                    
-                    # Parse salary information
-                    salary_info = self._extract_salary_info(job_data.get('salary_text', ''))
-                    
-                    # Categorize job
-                    category = self._categorize_job(job_data['title'], job_data['description'])
-                    
-                    # Extract skills from description (use text version for analysis)
-                    description_for_analysis = job_data.get('text_description', job_data['description'])
-                    skills_data = self._extract_skills_from_description(description_for_analysis)
-                    
-                    # Convert ALL skills to strings - NO TRUNCATION AS USER REQUESTED
-                    skills_list = skills_data.get('skills', [])
-                    preferred_skills_list = skills_data.get('preferred_skills', [])
-                    
-                    # Join ALL skills - IGNORE database field limits as requested by user
-                    skills_str = ', '.join(skills_list)
-                    preferred_skills_str = ', '.join(preferred_skills_list)
-                    
-                    # USER WANTS ALL SKILLS - NO TRUNCATION
-                    # Store everything regardless of length
-                    
-                    # Parse posted date - enhanced to handle absolute dates
-                    posted_date = self._parse_posted_date(job_data.get('posted_ago', ''))
-                    
-                    # Create unique external URL
-                    external_url = job_data.get('job_url', f"{self.jobs_url}#{uuid.uuid4()}")
-                    
-                    # Check if job already exists
-                    existing_job = JobPosting.objects.filter(external_url=external_url).first()
-                    if existing_job:
-                        logger.info(f"Job already exists: {job_data['title']} at {company.name}")
-                        return False
-                    
-                    # Create job posting with enhanced fields
-                    job_posting = JobPosting.objects.create(
-                        title=job_data['title'],
-                        description=job_data['description'],  # Now contains HTML content
-                        company=company,
-                        location=location,
-                        posted_by=self.scraper_user,
-                        job_category=category,
-                        job_type='full_time',  # Default for mining jobs
-                        salary_min=salary_info.get('min'),
-                        salary_max=salary_info.get('max'),
-                        salary_currency=salary_info.get('currency', 'AUD'),
-                        salary_type=salary_info.get('type', 'yearly'),
-                        salary_raw_text=salary_info.get('raw_text', ''),
-                        external_source='miningcareers.com.au',
-                        external_url=external_url,
-                        posted_ago=job_data.get('posted_ago', ''),
-                        date_posted=posted_date,  # Enhanced date parsing
-                        skills=skills_str,  # NEW: Extracted skills
-                        preferred_skills=preferred_skills_str,  # NEW: Extracted preferred skills
-                        status='active',
-                        additional_info={
-                            'scraper_version': '4.0',  # Updated version - ALL SKILLS CAPTURED
-                            'scraped_from': 'miningcareers.com.au',
-                            'original_data': job_data,
-                            'all_skills_extracted': skills_list,  # Complete skills list
-                            'all_preferred_skills_extracted': preferred_skills_list,  # Complete preferred skills list
-                            'total_skills_count': len(skills_list),  # Total skills found
-                            'total_preferred_skills_count': len(preferred_skills_list),  # Total preferred skills found
-                            'html_description': True,  # Flag indicating HTML format
-                            'posted_date_parsed': posted_date.isoformat() if posted_date else None,
-                            'no_truncation': True  # Flag indicating ALL skills stored
-                        }
-                    )
-                    
-                    logger.info(f"SUCCESS: Saved job: {job_data['title']} at {company.name} - {location.name}")
-                    logger.info(f"  ALL SKILLS CAPTURED ({len(skills_list)}): {skills_str}")
-                    logger.info(f"  ALL PREFERRED SKILLS CAPTURED ({len(preferred_skills_list)}): {preferred_skills_str}")
-                    logger.info(f"  TOTAL SKILLS STORED: {len(skills_list) + len(preferred_skills_list)}")
-                    return True
-                    
-            except Exception as e:
-                logger.error(f"ERROR: Error saving job to database: {e}")
+        try:
+            # Close any existing connections
+            connections.close_all()
+            
+            # Validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('job_url', '')
+            
+            if not job_title or not job_url:
+                logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
                 return False
-        
-        # Run in separate thread to avoid async context issues
-        import threading
-        result = [False]
-        
-        def run_save():
-            result[0] = save_job()
-        
-        thread = threading.Thread(target=run_save)
-        thread.start()
-        thread.join()
-        
-        return result[0]
+            
+            # Parse salary information
+            salary_info = self._extract_salary_info(job_data.get('salary_text', ''))
+            
+            # Categorize job
+            category = self._categorize_job(job_data['title'], job_data.get('description', ''))
+            
+            # Extract skills from description (use text version for analysis)
+            description_for_analysis = job_data.get('text_description', job_data.get('description', ''))
+            skills_data = self._extract_skills_from_description(description_for_analysis, job_data['title'])
+            
+            # Convert ALL skills to strings - NO TRUNCATION AS USER REQUESTED
+            skills_list = skills_data.get('skills', [])
+            preferred_skills_list = skills_data.get('preferred_skills', [])
+            
+            # Join ALL skills
+            skills_str = ', '.join(skills_list)
+            preferred_skills_str = ', '.join(preferred_skills_list)
+            
+            # Parse posted date - enhanced to handle absolute dates
+            posted_date = self._parse_posted_date(job_data.get('posted_ago', ''))
+            
+            # Convert date to string for JSON serialization
+            posted_date_str = ''
+            if posted_date:
+                if hasattr(posted_date, 'isoformat'):
+                    posted_date_str = posted_date.isoformat()
+                else:
+                    posted_date_str = str(posted_date)
+            
+            # Handle external URL - ensure it's valid
+            external_url = job_url.strip()
+            if not external_url:
+                timestamp = int(datetime.now().timestamp())
+                external_url = f"https://miningcareers.com.au/job/{slugify(job_title)}-{timestamp}/"
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = external_url.split('/')[-2] if external_url.endswith('/') else external_url.split('/')[-1]
+            
+            # Determine job type
+            job_type = 'Full-time'  # Default for mining jobs
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_data.get('description', ''),  # HTML description
+                'company_name': job_data.get('company_name', 'Unknown Company'),
+                'location': job_data.get('location', 'Australia'),
+                'salary': job_data.get('salary_text', ''),
+                'job_type': job_type,
+                'category': category,
+                'posted_ago': job_data.get('posted_ago', ''),
+                
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': 'on_site',
+                'skills': skills_str,
+                'preferred_skills': preferred_skills_str,
+                'posted_date': posted_date_str,
+                'experience_level': 'mid_level',
+                
+                # Store all raw data for ETL processing
+                'raw_miningcareers_data': {
+                    'salary_min': str(salary_info.get('min', '')) if salary_info.get('min') else '',
+                    'salary_max': str(salary_info.get('max', '')) if salary_info.get('max') else '',
+                    'salary_currency': salary_info.get('currency', 'AUD'),
+                    'salary_type': salary_info.get('type', 'yearly'),
+                    'company_logo': job_data.get('company_logo', ''),
+                    'all_skills_extracted': skills_list,
+                    'all_preferred_skills_extracted': preferred_skills_list,
+                    'total_skills_count': len(skills_list),
+                    'total_preferred_skills_count': len(preferred_skills_list),
+                    'html_description': True,
+                    'scraper_version': 'MiningCareers-Playwright-Australia-1.0-ETL',
+                    'country': 'Australia',
+                    'no_truncation': True
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='miningcareers.com.au',
+                job_url=external_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            logger.info(f"  Company: {staging_data['company_name']}")
+            logger.info(f"  Category: {staging_data['category']}")
+            logger.info(f"  Location: {staging_data['location']}")
+            logger.info(f"  Skills ({len(skills_list)}): {skills_str or 'Not specified'}")
+            logger.info(f"  Preferred Skills ({len(preferred_skills_list)}): {preferred_skills_str or 'Not specified'}")
+            
+            return True
+                
+        except Exception as e:
+            logger.error(f"Error saving job to staging: {e}")
+            logger.exception(e)
+            return False
     
     def scrape_jobs(self):
         """
@@ -1731,11 +1799,17 @@ class MiningCareersJobScraper:
                                 job_data['text_description'] = job_data['description']
                                 logger.info(f"Generated basic description (no URL) for: {job_data['title']}")
                         
-                        # Save to database
-                        if self._save_job_to_database_sync(job_data):
+                        # Save to database (using thread wrapper to avoid async context issues)
+                        result = self.save_job_to_database(job_data)
+                        if result == True:
                             jobs_scraped += 1
+                            self.jobs_saved += 1
                             self.scraped_jobs.append(job_data)
                             logger.info(f"Saved job {jobs_scraped}/{self.max_jobs}: {job_data['title']}")
+                        elif result == "duplicate":
+                            self.duplicates_found += 1
+                        else:
+                            self.errors_count += 1
                         
                         # Add delay between operations
                         time.sleep(random.uniform(1.0, 2.0))
@@ -1888,34 +1962,286 @@ class MiningCareersJobScraper:
         return self.scraped_jobs
     
     def get_stats(self):
-        """Get scraping statistics."""
-        total_jobs = JobPosting.objects.filter(external_source='miningcareers.com.au').count()
-        recent_jobs = JobPosting.objects.filter(
-            external_source='miningcareers.com.au',
-            scraped_at__gte=timezone.now() - timedelta(days=1)
-        ).count()
+        """Get scraping statistics from staging jobs."""
+        from apps.jobs.models import StagingJob
+        
+        def get_staging_stats():
+            try:
+                total_jobs = StagingJob.objects.filter(external_source='miningcareers.com.au').count()
+                pending_jobs = StagingJob.objects.filter(
+                    external_source='miningcareers.com.au',
+                    is_processed=False
+                ).count()
+                return total_jobs, pending_jobs
+            except Exception as e:
+                logger.error(f"Error getting staging stats: {e}")
+                return 0, 0
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(get_staging_stats)
+            total_jobs, pending_jobs = future.result()
         
         return {
             'total_jobs_in_db': total_jobs,
-            'recent_jobs_24h': recent_jobs,
-            'current_session': len(self.scraped_jobs)
+            'pending_etl': pending_jobs,
+            'current_session': self.jobs_saved
         }
+
+
+def reset_database():
+    """Reset/clear all MiningCareers jobs data from staging."""
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='miningcareers.com.au').count()
+            StagingJob.objects.filter(external_source='miningcareers.com.au').delete()
+            logger.info(f"[RESET] Cleared {deleted_count} MiningCareers jobs from staging")
+            return True
+        except Exception as e:
+            logger.error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logger.error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped MiningCareers jobs."""
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.jobs_saved,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicates_found,  # Scraper duplicates
+                    'errors': scraper.errors_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='miningcareers.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending MiningCareers jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='miningcareers.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} MiningCareers jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='miningcareers.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='miningcareers.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logger.error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'miningcareers.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.jobs_saved,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicates_found
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.jobs_saved,
+            total_processed=0,
+            total_duplicates=scraper.duplicates_found,
+            total_errors=scraper.errors_count,
+            new_skills_added=0,
+            status='success' if scraper.errors_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.jobs_saved}")
+        print(f"   Duplicates: {scraper.duplicates_found}")
+        print(f"   Errors: {scraper.errors_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
 
 
 def main():
     """Main function to run the scraper."""
-    # Get max jobs from command line argument
-    max_jobs = 50
-    if len(sys.argv) > 1:
-        try:
-            max_jobs = int(sys.argv[1])
-        except ValueError:
-            logger.error("Invalid max_jobs argument. Using default of 50.")
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='MiningCareers Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=50,
+                       help='Maximum number of jobs to scrape (default: 50)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing MiningCareers jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
+    
+    args = parser.parse_args()
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing MiningCareers jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    max_jobs = args.job_limit
+    logger.info(f"Job limit set to: {max_jobs}")
     
     # Create and run scraper
-    scraper = MiningCareersJobScraper(max_jobs=max_jobs, headless=True)
-    
     try:
+        scraper = MiningCareersJobScraper(max_jobs=max_jobs, headless=True)
+        
         # Scrape jobs
         scraped_jobs = scraper.scrape_jobs()
         
@@ -1924,46 +2250,73 @@ def main():
         logger.info("=" * 60)
         logger.info("MINING CAREERS SCRAPING STATISTICS")
         logger.info("=" * 60)
-        logger.info(f"Total jobs in database: {stats['total_jobs_in_db']}")
-        logger.info(f"Jobs scraped in last 24h: {stats['recent_jobs_24h']}")
+        logger.info(f"Total jobs in staging: {stats['total_jobs_in_db']}")
+        logger.info(f"Jobs pending ETL: {stats['pending_etl']}")
         logger.info(f"Jobs scraped this session: {stats['current_session']}")
         logger.info("=" * 60)
         
-        # Print sample jobs
-        if scraped_jobs:
-            logger.info("Sample scraped jobs:")
-            for i, job in enumerate(scraped_jobs[:3]):
-                logger.info(f"{i+1}. {job['title']} at {job['company_name']} - {job['location']}")
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
         
     except KeyboardInterrupt:
         logger.info("Scraping interrupted by user")
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
-        sys.exit(1)
+        raise
 
 
 def run(max_jobs: int = 300):
-    """Entry point used by the Celery scheduler.
-
-    Creates a `MiningCareersJobScraper`, runs it, and returns a small summary
-    dictionary that the task can record/log.
+    """Automation entrypoint for MiningCareers scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
     """
     try:
+        # Run scraping
         scraper = MiningCareersJobScraper(max_jobs=max_jobs, headless=True)
         scraped_jobs = scraper.scrape_jobs()
-        stats = scraper.get_stats()
+        
+        summary = {
+            'jobs_scraped': scraper.jobs_saved,
+            'jobs_saved': scraper.jobs_saved,
+            'duplicates_found': scraper.duplicates_found,
+            'errors_count': scraper.errors_count,
+        }
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logger.error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'summary': summary,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
-            'scraped_count': len(scraped_jobs),
-            'db_total': stats.get('total_jobs_in_db'),
-            'recent_24h': stats.get('recent_jobs_24h'),
-            'message': f"Successfully scraped {len(scraped_jobs)} MiningCareers jobs"
+            'summary': summary,
+            'message': 'MiningCareers scraping and ETL completed'
+        }
+    except SystemExit as e:
+        return {
+            'success': int(getattr(e, 'code', 1)) == 0,
+            'exit_code': getattr(e, 'code', 1)
         }
     except Exception as e:
-        logger.error(f"Scraping failed in run(): {e}")
+        try:
+            logger.error(f"Scraping failed in run(): {e}")
+        except Exception:
+            pass
         return {
             'success': False,
-            'error': str(e),
+            'error': str(e)
         }
 
 

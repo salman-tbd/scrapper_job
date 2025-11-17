@@ -218,6 +218,14 @@ class JobScheduler(models.Model):
     )
     enabled = models.BooleanField(default=True)
     last_run_at = models.DateTimeField(null=True, blank=True)
+    
+    # Source tracking for JobIngestionSummary integration
+    source_name = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Source identifier for JobIngestionSummary (e.g., jobs.act.gov.au, seek.com.au)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -380,9 +388,77 @@ class Tbl_Machine_Registry(models.Model):
         return (self.successful_transmissions / self.total_transmissions) * 100
 
 
+class PortalConfiguration(models.Model):
+    """
+    Dynamic configuration for each portal that receives job data.
+    Allows multiple portals with different settings without hardcoding.
+    """
+    # Portal Identity
+    portal_name = models.CharField(max_length=100, unique=True, help_text="Portal display name (e.g., TBD Project PC)")
+    portal_slug = models.SlugField(unique=True, help_text="URL-friendly identifier")
+    is_active = models.BooleanField(default=True, help_text="Enable/disable this portal")
+    
+    # Network Configuration
+    server_url = models.URLField(help_text="API endpoint URL where data will be sent")
+    
+    # Authentication
+    access_token = models.CharField(max_length=500, help_text="Portal access token",null=True,blank=True)
+    token_secret = models.CharField(max_length=500, help_text="Portal token secret",null=True,blank=True)
+    encryption_key = models.CharField(max_length=500, help_text="Fernet encryption key",null=True,blank=True)
+    
+    # Data Transmission Rules
+    job_limit = models.IntegerField(default=100, help_text="Maximum jobs to send per sync cycle")
+    sync_interval = models.IntegerField(default=60, help_text="Seconds between sync cycles")
+    send_all_jobs = models.BooleanField(default=False, help_text="If True, send ALL jobs (ignore time filtering)")
+    
+    # Data Filters (Optional - JSONField for flexibility)
+    allowed_sources = models.JSONField(
+        default=list, 
+        blank=True, 
+        help_text="List of allowed sources e.g., ['seek', 'act_gov']. Empty = all sources"
+    )
+    allowed_statuses = models.JSONField(
+        default=list, 
+        blank=True, 
+        help_text="List of allowed statuses e.g., ['active', 'closed']. Empty = all statuses"
+    )
+    allowed_categories = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of allowed job categories. Empty = all categories"
+    )
+    
+    # Sync Tracking
+    last_sync_at = models.DateTimeField(null=True, blank=True, help_text="When the last sync completed")
+    last_sync_status = models.CharField(max_length=20, blank=True, help_text="Success/failed/timeout")
+    total_syncs = models.PositiveIntegerField(default=0)
+    successful_syncs = models.PositiveIntegerField(default=0)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "Portal Configuration"
+        verbose_name_plural = "Portal Configurations"
+        ordering = ['portal_name']
+    
+    def __str__(self):
+        status = "✓ Active" if self.is_active else "✗ Inactive"
+        return f"{self.portal_name} ({status})"
+    
+    @property
+    def success_rate(self):
+        """Calculate sync success rate."""
+        if self.total_syncs == 0:
+            return 0.0
+        return (self.successful_syncs / self.total_syncs) * 100
+
+
 class Tbl_Job_Transmission_Log(models.Model):
     """Log of job data transmissions to EvolGroups."""
     machine = models.ForeignKey(Tbl_Machine_Registry, on_delete=models.CASCADE, related_name='transmissions')
+    portal = models.ForeignKey(PortalConfiguration, on_delete=models.CASCADE, null=True, blank=True, related_name='transmissions', help_text="Which portal this transmission was sent to")
     
     # Transmission details
     transmission_id = models.CharField(max_length=50, unique=True, help_text="Unique ID for this transmission")
@@ -430,7 +506,7 @@ class Tbl_Job_Transmission_Log(models.Model):
 class Tbl_Job_Transmission_Items(models.Model):
     """Individual job items within a transmission."""
     transmission_log = models.ForeignKey(Tbl_Job_Transmission_Log, on_delete=models.CASCADE, related_name='items')
-    job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE)
+    job_posting = models.ForeignKey("PortalJob", on_delete=models.CASCADE, null=True, blank=True, help_text="Original PortalJob")
     
     # Item details
     item_type = models.CharField(max_length=20, choices=[
@@ -478,4 +554,345 @@ def save_node_user(record):
         return user
     except Exception as e:
         logging.error(f"Failed to save node user: {e}")
+        return None
+
+
+# ==========================================
+# ETL PIPELINE MODELS (Staging → Vault → Portal)
+# ==========================================
+
+class StagingJob(models.Model):
+    """
+    Raw scraped job data before any processing or cleaning.
+    This is the first stage in the ETL pipeline.
+    """
+    # External source info
+    external_source = models.CharField(max_length=100, help_text="Source website name (e.g., seek.com.au)")
+    external_url = models.URLField(help_text="Original job posting URL")
+    external_id = models.CharField(max_length=100, blank=True, help_text="External system job ID")
+    
+    # Raw job data (uncleaned)
+    title = models.TextField(blank=True)
+    description = models.TextField(blank=True)
+    company_name = models.TextField(blank=True)
+    location_raw = models.TextField(blank=True)
+    salary_raw = models.TextField(blank=True)
+    job_type_raw = models.TextField(blank=True)
+    category_raw = models.TextField(blank=True)
+    posted_ago_raw = models.TextField(blank=True)
+    
+    # Raw employer contact data (will be moved to vault)
+    employer_contact_raw = models.TextField(blank=True)
+    employer_email_raw = models.TextField(blank=True)
+    employer_phone_raw = models.TextField(blank=True)
+    employer_address_raw = models.TextField(blank=True)
+    
+    # Additional scraped data
+    raw_data = models.JSONField(default=dict, blank=True, help_text="Complete raw scraped data")
+    
+    # Processing status
+    is_processed = models.BooleanField(default=False)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    processing_error = models.TextField(blank=True)
+    
+    # Timestamps
+    scraped_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-scraped_at']
+        verbose_name = 'Staging Job'
+        verbose_name_plural = 'Staging Jobs'
+        indexes = [
+            models.Index(fields=['external_source', 'is_processed']),
+            models.Index(fields=['scraped_at']),
+        ]
+    
+    def __str__(self):
+        return f"[{self.external_source}] {self.title[:50]}"
+
+
+class VaultJob(models.Model):
+    """
+    Secure storage for employer/sensitive data.
+    This data is NEVER exposed to the public portal.
+    """
+    # Link to staging (optional, for traceability)
+    staging_job = models.ForeignKey(StagingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='vault_records')
+    
+    # Unique identifier
+    hash_key = models.CharField(max_length=64, unique=True, help_text="SHA256 hash of job URL for deduplication")
+    
+    # Employer data (encrypted/private)
+    employer_name = models.CharField(max_length=200, blank=True)
+    employer_contact_person = models.CharField(max_length=200, blank=True)
+    employer_email = models.EmailField(blank=True)
+    employer_phone = models.CharField(max_length=50, blank=True)
+    employer_address = models.TextField(blank=True)
+    employer_website = models.URLField(blank=True)
+    
+    # Original job details (for internal reference)
+    original_title = models.CharField(max_length=500)
+    original_description = models.TextField()
+    original_url = models.URLField()
+    external_source = models.CharField(max_length=100)
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_encrypted = models.BooleanField(default=False, help_text="Whether sensitive fields are encrypted")
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Vault Job'
+        verbose_name_plural = 'Vault Jobs'
+        indexes = [
+            models.Index(fields=['hash_key']),
+            models.Index(fields=['external_source']),
+        ]
+    
+    def __str__(self):
+        return f"Vault: {self.employer_name} - {self.original_title[:50]}"
+
+
+class PortalJob(models.Model):
+    """
+    Anonymised, cleaned job listings for public display.
+    This is the final stage of the ETL pipeline.
+    NO employer contact details are stored here.
+    """
+    # Link to vault (for admin reference only)
+    vault_job = models.ForeignKey(VaultJob, on_delete=models.CASCADE, related_name='portal_listings')
+    
+    # Unique identifier
+    JOB_TYPE_CHOICES = [
+        ('full_time', 'Full Time'),
+        ('part_time', 'Part Time'),
+        ('casual', 'Casual'),
+        ('contract', 'Contract'),
+        ('temporary', 'Temporary'),
+        ('permanent', 'Permanent'),
+        ('internship', 'Internship'),
+        ('freelance', 'Freelance'),
+    ]
+
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('inactive', 'Inactive'),
+        ('expired', 'Expired'),
+        ('filled', 'Filled'),
+    ]
+
+    SALARY_TYPE_CHOICES = [
+        ('hourly', 'Hourly'),
+        ('daily', 'Daily'),
+        ('weekly', 'Weekly'),
+        ('monthly', 'Monthly'),
+        ('yearly', 'Yearly'),
+    ]
+
+    CURRENCY_CHOICES = [
+        ('AUD', 'Australian Dollar'),
+        ('USD', 'US Dollar'),
+        ('EUR', 'Euro'),
+        ('GBP', 'British Pound'),
+    ]
+
+    JOB_CATEGORY_CHOICES = [
+        # Core/general
+        ('technology', 'Technology'),
+        ('finance', 'Finance'),
+        ('healthcare', 'Healthcare'),
+        ('marketing', 'Marketing'),
+        ('sales', 'Sales'),
+        ('hr', 'Human Resources'),
+        ('education', 'Education'),
+        ('retail', 'Retail'),
+        ('hospitality', 'Hospitality'),
+        ('construction', 'Construction'),
+        ('manufacturing', 'Manufacturing'),
+        ('consulting', 'Consulting'),
+        ('legal', 'Legal'),
+        # Extended to match Australian boards like Chandler Macleod
+        ('office_support', 'Office Support'),
+        ('drivers_operators', 'Drivers & Operators'),
+        ('technical_engineering', 'Technical & Engineering'),
+        ('production_workers', 'Production Workers'),
+        ('transport_logistics', 'Transport & Logistics'),
+        ('mining_resources', 'Mining & Resources'),
+        ('sales_marketing', 'Sales & Marketing'),
+        ('executive', 'Executive'),
+        ('other', 'Other'),
+    ]
+
+    # Basic Information
+    title = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=250, unique=True)
+    description = models.TextField()
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='portal_job_postings', null=True, blank=True)
+    posted_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='portal_posted_jobs', null=True, blank=True)
+    location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, related_name='portal_jobs')
+
+    # Job Details
+    job_category = models.CharField(max_length=50, choices=JOB_CATEGORY_CHOICES, default='other')
+    job_type = models.CharField(max_length=20, choices=JOB_TYPE_CHOICES, default='full_time')
+    experience_level = models.CharField(max_length=100, blank=True)
+    work_mode = models.CharField(max_length=50, blank=True, help_text="Remote, Hybrid, On-site, etc.")
+
+    # Salary Information
+    salary_min = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    salary_max = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    salary_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='AUD')
+    salary_type = models.CharField(max_length=10, choices=SALARY_TYPE_CHOICES, default='yearly')
+    salary_raw_text = models.CharField(max_length=200, blank=True, help_text="Original salary text")
+
+    # External Source Information
+    external_source = models.CharField(max_length=100, default='seek.com.au')
+    external_url = models.URLField(unique=True, help_text="Original job posting URL")
+    external_id = models.CharField(max_length=100, blank=True, help_text="External system job ID")
+
+    # Metadata
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    posted_ago = models.CharField(max_length=50, blank=True, help_text="Relative date like '2 days ago'")
+    date_posted = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True, help_text="When the job was marked expired")
+    tags = models.TextField(blank=True, help_text="Comma-separated tags or skills")
+
+    # Timestamps
+    scraped_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # Additional Data
+    additional_info = models.JSONField(default=dict, blank=True, help_text="Store any additional scraped data")
+    job_closing_date = models.CharField(null=True, blank=True)
+    skills = models.ManyToManyField('SkillMaster', blank=True, related_name='jobs_with_skill')
+    preferred_skills = models.ManyToManyField('SkillMaster', blank=True, related_name='jobs_preferring_skill')
+
+
+    class Meta:
+        ordering = ['-scraped_at']
+        verbose_name = 'Portal Job'
+        verbose_name_plural = 'Portal Jobs'
+        indexes = [
+            models.Index(fields=['status', 'external_source']),
+            models.Index(fields=['location', 'job_category']),
+            models.Index(fields=['job_category']),
+            models.Index(fields=['date_posted']),
+        ]
+    
+    def __str__(self):
+        return f"{self.title} - {self.company.name}"
+    
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base_slug = slugify(self.title)
+            unique_slug = base_slug
+            counter = 1
+            while PortalJob.objects.filter(slug=unique_slug).exists():
+                unique_slug = f"{base_slug}-{counter}"
+                counter += 1
+            self.slug = unique_slug
+        super().save(*args, **kwargs)
+    
+    @property
+    def required_skills_list(self):
+        """Return required skills as a list of skill names."""
+        return list(self.skills.values_list('skill_name', flat=True))
+    
+    @property
+    def preferred_skills_list(self):
+        """Return preferred skills as a list of skill names."""
+        return list(self.preferred_skills.values_list('skill_name', flat=True))
+
+
+class SkillMaster(models.Model):
+    """
+    Master list of all known skills.
+    Auto-learns new skills from job descriptions.
+    """
+    CHOICE_TYPE = [
+        ('required', 'Required Skill'),
+        ('preferred', 'Preferred Skill'),
+    ]
+    skill_name = models.CharField(max_length=100, unique=True)
+    skill_category = models.CharField(max_length=50, blank=True, help_text="e.g., Programming, Management, Design")
+    skills = models.CharField(max_length=20, choices=CHOICE_TYPE, blank=True, null=True, help_text="Classify if this is a required or preferred skill")
+    preferred_skills = models.CharField(max_length=20, choices=CHOICE_TYPE, blank=True, null=True, help_text="Alternative choice classification")
+    occurrence_count = models.PositiveIntegerField(default=0, help_text="How many times this skill has been found")
+    is_verified = models.BooleanField(default=False, help_text="Manually verified by admin")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['-occurrence_count', 'skill_name']
+        verbose_name = 'Skill Master'
+        verbose_name_plural = 'Skill Master'
+        indexes = [
+            models.Index(fields=['skill_name']),
+            models.Index(fields=['is_active', 'occurrence_count']),
+        ]
+    
+    def __str__(self):
+        return f"{self.skill_name}"
+
+
+class JobIngestionSummary(models.Model):
+    """
+    Daily summary of ETL pipeline execution per source.
+    Tracks performance and data quality metrics for each scraper.
+    """
+    # Source identification
+    source = models.CharField(max_length=100, default='all_sources', help_text="Scraper source (e.g., apsjobs.gov.au, jobs.act.gov.au)")
+    
+    # Date/time
+    summary_date = models.DateField()
+    execution_started_at = models.DateTimeField(auto_now_add=True)
+    execution_finished_at = models.DateTimeField(null=True, blank=True)
+    
+    # ETL Statistics
+    total_scraped = models.PositiveIntegerField(default=0, help_text="Total jobs scraped")
+    total_processed = models.PositiveIntegerField(default=0, help_text="Successfully processed jobs")
+    total_duplicates = models.PositiveIntegerField(default=0, help_text="Duplicate jobs skipped")
+    total_errors = models.PositiveIntegerField(default=0, help_text="Processing errors")
+    
+    # Skill learning
+    new_skills_added = models.PositiveIntegerField(default=0, help_text="New skills discovered")
+    
+    # Data quality
+    jobs_with_salary = models.PositiveIntegerField(default=0)
+    jobs_with_skills = models.PositiveIntegerField(default=0)
+    jobs_with_location = models.PositiveIntegerField(default=0)
+    
+    # Source breakdown
+    source_breakdown = models.JSONField(default=dict, blank=True, help_text="Stats per scraping source")
+    
+    # Status
+    status = models.CharField(max_length=20, default='running', choices=[
+        ('running', 'Running'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+        ('partial', 'Partial Success')
+    ])
+    error_log = models.TextField(blank=True)
+    
+    class Meta:
+        ordering = ['-summary_date', 'source']
+        verbose_name = 'Job Ingestion Summary'
+        verbose_name_plural = 'Job Ingestion Summaries'
+        unique_together = [['summary_date', 'source']]  # Each source gets its own daily record
+    
+    def __str__(self):
+        return f"ETL Summary {self.summary_date} ({self.source}) - {self.total_processed} jobs"
+    
+    @property
+    def success_rate(self):
+        """Calculate ETL success rate."""
+        if self.total_scraped == 0:
+            return 0.0
+        return (self.total_processed / self.total_scraped) * 100
+    
+    @property
+    def duration(self):
+        """Calculate execution duration."""
+        if self.execution_finished_at and self.execution_started_at:
+            return self.execution_finished_at - self.execution_started_at
         return None

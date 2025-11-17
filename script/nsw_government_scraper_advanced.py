@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-Professional NSW Government Job Scraper
-=======================================
+Professional NSW Government Job Scraper with ETL Pipeline
+==========================================================
 
-Scrapes job listings from iworkfor.nsw.gov.au with:
-- Enhanced duplicate detection (URL + title+company)
-- Professional database structure (JobPosting, Company, Location)
-- Automatic job categorization
+Advanced scraper for iworkfor.nsw.gov.au that follows the ETL pipeline architecture:
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
+- Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
+- Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid bot detection
 - Robust error handling and logging
 - Thread-safe database operations
-- Adaptive scraping for NSW Government job portal
+- Skills limited to 4-6 per job (as per requirement)
+- ETL-ready data saved to StagingJob table
 
 This scraper handles the NSW Government's official job portal which uses:
 - Ajax pagination
@@ -19,11 +29,22 @@ This scraper handles the NSW Government's official job portal which uses:
 - Job detail pages with rich information
 
 Usage:
-    python nsw_government_scraper_advanced.py [job_limit]
+    python nsw_government_scraper_advanced.py [job_limit] [options]
     
 Examples:
-    python nsw_government_scraper_advanced.py 100   # Scrape 100 jobs
-    python nsw_government_scraper_advanced.py       # Scrape all jobs (no limit)
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python nsw_government_scraper_advanced.py --auto-etl           # Scrape all + auto ETL
+    python nsw_government_scraper_advanced.py 50 --auto-etl       # Scrape 50 + auto ETL
+    
+    # Two-step manual process
+    python nsw_government_scraper_advanced.py 30                  # Scrape only
+    python manage.py run_etl_pipeline --source=iworkfor.nsw.gov.au  # Then run ETL
+    
+    # Other options
+    python nsw_government_scraper_advanced.py 100 --reset         # Clear staging first
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -51,6 +72,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 
 class NSWGovernmentJobScraper:
@@ -340,6 +362,10 @@ class NSWGovernmentJobScraper:
         essential = normalize(essential)
         preferred = normalize(preferred)
 
+        # Limit to 4-6 skills as per requirement
+        essential_limited = essential[:4]  # Max 6 skills
+        preferred_limited = preferred[:4]  # Max 5 preferred skills
+
         # Build comma-separated strings within model limits (200 chars)
         def join_with_limit(items, max_len=200):
             out = []
@@ -353,8 +379,8 @@ class NSWGovernmentJobScraper:
                     break
             return ", ".join(out)
 
-        skills_str = join_with_limit(essential)
-        preferred_str = join_with_limit(preferred)
+        skills_str = join_with_limit(essential_limited)
+        preferred_str = join_with_limit(preferred_limited)
 
         return {
             "skills": skills_str,
@@ -1347,7 +1373,7 @@ class NSWGovernmentJobScraper:
             return 'other'
     
     def _save_job_sync(self, job_data, bot_user):
-        """Synchronous database save operation."""
+        """Synchronous database save operation to StagingJob for ETL processing."""
         from django.db import connections
         
         # Validate required fields
@@ -1356,62 +1382,8 @@ class NSWGovernmentJobScraper:
             return False
         
         try:
-            # Check for duplicates - improved duplicate detection
-            try:
-                # Check by URL first
-                existing_job = JobPosting.objects.filter(external_url=job_data['url']).first()
-                if existing_job:
-                    self.duplicate_count += 1
-                    self.logger.info(f"Duplicate job found by URL: {job_data['title']}")
-                    return False
-                
-                # Check by title and company combination for better duplicate detection
-                if job_data.get('title') and job_data.get('company'):
-                    title_match = JobPosting.objects.filter(
-                        title=job_data['title'],
-                        company__name=job_data['company']
-                    ).first()
-                    if title_match:
-                        self.duplicate_count += 1
-                        self.logger.info(f"Duplicate job found by title+company: {job_data['title']}")
-                        return False
-                        
-            except Exception as e:
-                self.logger.warning(f"Could not check for duplicates: {e}")
-                # Continue anyway
-            
-            # Create company
-            company_name = job_data.get('company', 'NSW Government')
-            company, created = Company.objects.get_or_create(
-                name=company_name,
-                defaults={
-                    'description': f"NSW Government agency or department",
-                    'website': self.base_url,
-                    'company_size': 'enterprise'  # NSW Government is enterprise size
-                }
-            )
-            
-            # Create location
-            location = None
-            location_text = job_data.get('location')
-            if location_text:
-                location_text = location_text.strip()
-                if 'nsw' not in location_text.lower():
-                    location_text += ', NSW'
-                if 'australia' not in location_text.lower():
-                    location_text += ', Australia'
-                
-                # Ensure location name doesn't exceed database limit
-                if len(location_text) > 100:
-                    location_text = location_text[:97] + "..."
-                
-                location, created = Location.objects.get_or_create(
-                    name=location_text,
-                    defaults={
-                        'state': 'NSW',
-                        'country': 'Australia'
-                    }
-                )
+            # Close any existing connections
+            connections.close_all()
             
             # Parse salary
             salary_min, salary_max, salary_raw, salary_type = self.extract_salary_info(
@@ -1454,60 +1426,100 @@ class NSWGovernmentJobScraper:
                 work_type_lower = job_data['work_type'].lower()
                 job_type = work_type_mapping.get(work_type_lower, 'full_time')
             
-            # Create job posting - handle async context
-            try:
-                from django.db import transaction
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'],
-                    description=description_to_store,
-                    company=company,
-                    posted_by=bot_user,
-                    location=location,
-                    job_category=job_category,
-                    job_type=job_type,
-                    experience_level=job_data.get('experience_level', ''),
-                    work_mode=job_data.get('work_mode', ''),
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_raw_text=salary_raw or '',
-                    salary_type=salary_type,
-                    external_source='iworkfor.nsw.gov.au',
-                    external_url=job_data['url'],
-                    external_id=job_data.get('job_reference', ''),
-                    posted_ago=job_data.get('posted_ago', ''),
-                    date_posted=date_posted,
-                    tags=job_data.get('tags', ''),
-                    job_closing_date=job_data.get('closing_date', ''),
-                    skills=skills_payload.get('skills', ''),
-                    preferred_skills=skills_payload.get('preferred_skills', ''),
-                    additional_info={
-                        'category': job_data.get('category', ''),
-                        'requirements': job_data.get('requirements', ''),
-                        'closing_date': job_data.get('closing_date', ''),
-                        'description_html': job_data.get('description_html', ''),
-                        'description_text': job_data.get('description', ''),
-                        'skills_list': skills_payload.get('skills_list', []),
-                        'preferred_skills_list': skills_payload.get('preferred_skills_list', []),
-                        'scraper_version': '1.0'
-                    }
-                )
+            # Map job_type to standard format for staging
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual'
+            }
+            job_type_display = job_type_map.get(job_type, 'Full-time')
+            
+            # Convert dates to strings for JSON serialization
+            posted_date_str = ''
+            if date_posted and hasattr(date_posted, 'isoformat'):
+                posted_date_str = date_posted.isoformat()
+            elif date_posted:
+                posted_date_str = str(date_posted)
+            
+            closing_date_str = job_data.get('closing_date', '')
+            
+            # Extract external_id from job_reference
+            external_id = job_data.get('job_reference', '')
+            if not external_id:
+                # Use URL as fallback
+                external_id = job_data['url'].split('/')[-1] if '/' in job_data['url'] else job_data['url']
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_data['title'],
+                'description': description_to_store,
+                'company_name': job_data.get('company', 'NSW Government'),
+                'location': job_data.get('location', 'Not specified'),
+                'salary': salary_raw or '',
+                'job_type': job_type_display,
+                'category': job_category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                self.jobs_scraped += 1
-                self.logger.info(f"Saved job: {job_posting.title} at {company.name}")
-                return True
-            except Exception as db_error:
-                self.logger.error(f"Database error creating job posting: {db_error}")
-                self.logger.error(f"Job data that failed: title='{job_data.get('title', '')}' (len={len(job_data.get('title', ''))})")
-                self.logger.error(f"experience_level='{job_data.get('experience_level', '')}' (len={len(job_data.get('experience_level', ''))})")
-                self.logger.error(f"external_id='{job_data.get('job_reference', '')}' (len={len(job_data.get('job_reference', ''))})")
-                self.logger.error(f"work_mode='{job_data.get('work_mode', '')}' (len={len(job_data.get('work_mode', ''))})")
-                self.logger.error(f"external_source='iworkfor.nsw.gov.au' (len={len('iworkfor.nsw.gov.au')})")
+                # NSW-specific data
+                'employment_type': job_type_display,
+                'work_mode': job_data.get('work_mode', 'on_site'),
+                'skills': skills_payload.get('skills', ''),
+                'preferred_skills': skills_payload.get('preferred_skills', ''),
+                'closing_date': closing_date_str,
+                'posted_date': posted_date_str,
+                'experience_level': job_data.get('experience_level', ''),
+                
+                # Store all raw data for ETL processing
+                'raw_nsw_data': {
+                    'salary_min': str(salary_min) if salary_min else '',
+                    'salary_max': str(salary_max) if salary_max else '',
+                    'salary_type': salary_type,
+                    'category': job_data.get('category', ''),
+                    'requirements': job_data.get('requirements', ''),
+                    'description_html': job_data.get('description_html', ''),
+                    'description_text': job_data.get('description', ''),
+                    'skills_list': skills_payload.get('skills_list', []),
+                    'preferred_skills_list': skills_payload.get('preferred_skills_list', []),
+                    'scraper_version': '1.0_etl',
+                    'government_job': True
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='iworkfor.nsw.gov.au',
+                job_url=job_data['url'],
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                self.logger.error(f"Failed to save to staging: {job_data['title']}")
                 self.error_count += 1
                 return False
+            
+            if not created:
+                self.logger.info(f"[DUPLICATE] Skipped duplicate job: {job_data['title']}")
+                self.duplicate_count += 1
+                return "duplicate"
+            
+            # Success - log details
+            self.logger.info(f"[SUCCESS] Saved to staging: {job_data['title']}")
+            self.logger.info(f"  Company: {staging_data['company_name']}")
+            self.logger.info(f"  Category: {staging_data['category']}")
+            self.logger.info(f"  Location: {staging_data['location']}")
+            self.logger.info(f"  Job Reference: {external_id or 'Not specified'}")
+            self.logger.info(f"  Skills ({len(skills_payload.get('skills', '').split(',')) if skills_payload.get('skills') else 0}): {skills_payload.get('skills', 'Not specified')}")
+            
+            self.jobs_scraped += 1
+            return True
             
         except Exception as e:
             self.error_count += 1
             self.logger.error(f"Error saving job {job_data.get('title', 'Unknown')}: {e}")
+            self.logger.exception(e)
             return False
     
     def save_job(self, job_data, bot_user):
@@ -1806,48 +1818,299 @@ class NSWGovernmentJobScraper:
         self.logger.info("NSW GOVERNMENT SCRAPING SUMMARY")
         self.logger.info("=" * 50)
         self.logger.info(f"Pages scraped: {self.pages_scraped}")
-        self.logger.info(f"Jobs scraped: {self.jobs_scraped}")
+        self.logger.info(f"Jobs saved to staging: {self.jobs_scraped}")
         self.logger.info(f"Duplicates found: {self.duplicate_count}")
         self.logger.info(f"Errors encountered: {self.error_count}")
+        self.logger.info("")
+        self.logger.info("✅ ETL FLOW: Jobs saved to StagingJob table")
+        self.logger.info("📊 Next Step: Run ETL processing to transform data")
+        self.logger.info("    StagingJob → VaultJob + PortalJob → JobPosting")
         self.logger.info("=" * 50)
+
+
+def reset_database():
+    """Reset/clear all NSW Government Jobs data from staging."""
+    try:
+        from apps.jobs.models import StagingJob
+        deleted_count = StagingJob.objects.filter(external_source='iworkfor.nsw.gov.au').count()
+        StagingJob.objects.filter(external_source='iworkfor.nsw.gov.au').delete()
+        logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} NSW Government Jobs from staging")
+        return True
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped jobs."""
+    try:
+        print("")
+        print("=" * 70)
+        print("🔄 STARTING ETL PROCESSING")
+        print("=" * 70)
+        print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+        print("")
+        
+        # Import ETL processor
+        from apps.jobs.etl_processor import ETLProcessor
+        from apps.jobs.models import StagingJob
+        
+        # Get scraper statistics (always record, even if no new jobs)
+        scraper_stats = None
+        if scraper:
+            scraper_stats = {
+                'jobs_scraped': scraper.jobs_scraped,  # Jobs saved to staging
+                'duplicates_found': scraper.duplicate_count,  # Scraper duplicates
+                'errors': scraper.error_count
+            }
+        
+        # Check if there are jobs to process
+        pending_count = StagingJob.objects.filter(
+            external_source='iworkfor.nsw.gov.au',
+            is_processed=False
+        ).count()
+        
+        # Initialize empty results for when no ETL processing happens
+        results = {
+            'successful': 0,
+            'failed': 0,
+            'duplicates': 0,
+            'new_skills': 0
+        }
+        
+        if pending_count == 0:
+            print("No pending NSW Government Jobs to process in staging")
+            # Still create summary record even if no ETL processing
+            create_job_ingestion_summary(results, source='iworkfor.nsw.gov.au', scraper_stats=scraper_stats)
+            return
+        
+        print(f"Found {pending_count} NSW Government Jobs pending ETL processing...")
+        
+        # Run ETL processor
+        processor = ETLProcessor()
+        results = processor.process_staging_jobs(source='iworkfor.nsw.gov.au')
+        
+        # Create or update JobIngestionSummary record
+        create_job_ingestion_summary(results, source='iworkfor.nsw.gov.au', scraper_stats=scraper_stats)
+        
+        # Print only final results
+        print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+        
+    except Exception as e:
+        print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'iworkfor.nsw.gov.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.jobs_scraped,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicate_count
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.jobs_scraped,
+            total_processed=0,
+            total_duplicates=scraper.duplicate_count,
+            total_errors=scraper.error_count,
+            new_skills_added=0,
+            status='success' if scraper.error_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.jobs_scraped}")
+        print(f"   Duplicates: {scraper.duplicate_count}")
+        print(f"   Errors: {scraper.error_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
 
 
 def main():
     """Main function to run the scraper."""
     import argparse
     
-    parser = argparse.ArgumentParser(description='NSW Government Job Scraper')
+    parser = argparse.ArgumentParser(description='NSW Government Job Scraper with ETL')
     parser.add_argument('job_limit', nargs='?', type=int, default=None,
                        help='Maximum number of jobs to scrape (default: no limit)')
     parser.add_argument('--category', default='all',
                        help='Job category to scrape (default: all)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing NSW Government Jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
     args = parser.parse_args()
     
-    scraper = NSWGovernmentJobScraper(
-        job_category=args.category,
-        job_limit=args.job_limit
-    )
+    # Handle database reset if requested
+    if args.reset:
+        logging.getLogger(__name__).info("[RESET] Clearing existing NSW Government Jobs data...")
+        if not reset_database():
+            logging.getLogger(__name__).error("[RESET] Failed to reset staging, exiting")
+            return
     
-    scraper.run()
+    logging.getLogger(__name__).info(f"[START] Starting NSW Government scraper...")
+    logging.getLogger(__name__).info(f"Target jobs: {args.job_limit or 'No limit'}")
+    if args.reset:
+        logging.getLogger(__name__).info("[MODE] Database reset mode - starting fresh")
+    if args.auto_etl:
+        logging.getLogger(__name__).info("[MODE] Auto-ETL mode enabled")
+    
+    try:
+        scraper = NSWGovernmentJobScraper(
+            job_category=args.category,
+            job_limit=args.job_limit
+        )
+        
+        scraper.run()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).info("Scraping interrupted by user")
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Scraping failed: {str(e)}")
+        raise
 
 
 def run(job_limit=300, category='all'):
-    """Automation entrypoint for NSW Government scraper.
+    """Automation entrypoint for NSW Government scraper with auto-ETL.
 
-    Creates the scraper and runs it without CLI args. Returns a summary dict
-    for schedulers similar to Seek's run().
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
     """
     try:
+        # Run scraping
         scraper = NSWGovernmentJobScraper(job_category=category, job_limit=job_limit)
         scraper.run()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'pages_scraped': getattr(scraper, 'pages_scraped', None),
+                'jobs_scraped': getattr(scraper, 'jobs_scraped', None),
+                'duplicates_found': getattr(scraper, 'duplicate_count', None),
+                'errors_count': getattr(scraper, 'error_count', None),
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'pages_scraped': getattr(scraper, 'pages_scraped', None),
             'jobs_scraped': getattr(scraper, 'jobs_scraped', None),
             'duplicates_found': getattr(scraper, 'duplicate_count', None),
             'errors_count': getattr(scraper, 'error_count', None),
-            'message': f"Completed NSW scraping with {getattr(scraper, 'jobs_scraped', 0)} jobs processed"
+            'message': 'NSW Government scraping and ETL completed'
         }
     except SystemExit as e:
         return {

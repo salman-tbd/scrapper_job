@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-Professional ArtsHub Australia Job Scraper using Playwright with Pagination Support
-====================================================================================
+Professional ArtsHub Australia Job Scraper using Playwright with ETL Pipeline
+==============================================================================
 
 Advanced Playwright-based scraper for ArtsHub Australia (https://www.artshub.com.au/jobs/) 
-that integrates with your existing seek_scraper_project database structure:
+that integrates with your existing seek_scraper_project ETL pipeline:
 
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
 - Uses Playwright for modern, reliable web scraping
-- Full pagination support with infinite scroll "More" button handling
+- Saves raw data to StagingJob table (ETL first stage)
 - Professional database structure (JobPosting, Company, Location)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
+- Full pagination support with infinite scroll "More" button handling
 - Enhanced duplicate detection across all pages
 - Comprehensive error handling and logging
 - Arts and creative industry optimization
 - Processes all available jobs across multiple pages
+- ETL-ready data saved to StagingJob table
 
 Features:
 - 🔄 Full pagination support - scrapes all pages automatically
@@ -22,13 +32,28 @@ Features:
 - 🎯 Smart duplicate detection across pagination sessions
 - 🛡️ Safety limits to prevent infinite loops
 - 📈 Detailed pagination statistics and summaries
+- 🔄 ETL pipeline integration for professional data flow
 
 Usage:
-    python artshub_australia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python artshub_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python artshub_australia_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
     
+    # Two-step manual process
+    python artshub_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=artshub.com.au  # Then run ETL
+    
+    # Other options
+    python artshub_australia_scraper.py 100 --reset          # Clear staging first
+    python artshub_australia_scraper.py                      # Scrape all jobs
+
 Examples:
-    python artshub_australia_scraper.py 20    # Scrape 20 jobs (from multiple pages if needed)
-    python artshub_australia_scraper.py       # Scrape ALL available jobs across all pages
+    python artshub_australia_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python artshub_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python artshub_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -60,6 +85,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -565,23 +591,29 @@ class ArtsHubAustraliaJobScraper:
                         soup.select_one('.main-content') or
                         soup.body
                     )
+                    
                     # Remove apply buttons/controls
                     for el in container.select('a[href*="/apply/"], .button, [class*="button"]'):
                         try:
                             el.decompose()
                         except Exception:
                             pass
-                    # Fix relative links/images
-                    for a in container.select('a[href]'):
+                    
+                    # Remove ALL links but keep their text content
+                    for a_tag in container.select('a'):
                         try:
-                            a['href'] = urljoin(self.base_url, a['href'])
+                            # Replace link with its text content
+                            a_tag.replace_with(a_tag.get_text())
                         except Exception:
                             pass
+                    
+                    # Fix relative images (if any remain)
                     for img in container.select('img[src]'):
                         try:
                             img['src'] = urljoin(self.base_url, img['src'])
                         except Exception:
                             pass
+                    
                     full_description_html = (container.decode_contents() or '').strip()
                     if not full_description:
                         full_description = self.clean_description_text(container.get_text(' ', strip=True))
@@ -724,43 +756,98 @@ class ArtsHubAustraliaJobScraper:
     def extract_skills_from_text(self, text, max_items=12):
         """Generate skills and preferred skills from description text.
         Returns tuple (skills_csv, preferred_csv).
+        Ensures minimum 4-6 items in each field.
         """
         if not text:
-            return "", ""
+            text = ""
+        
         normalized = re.sub(r"[^a-z0-9\s\+\.#/&-]", " ", text.lower())
+        
+        # Expanded skill keywords for arts industry
         skill_keywords = [
             'communication', 'stakeholder management', 'leadership', 'problem solving', 'teamwork', 'planning',
             'budgeting', 'project management', 'agile', 'scrum', 'customer service', 'marketing', 'sales',
             'curation', 'exhibition', 'gallery', 'museum', 'fundraising', 'grant writing', 'event management',
             'creative direction', 'content creation', 'social media', 'adobe photoshop', 'adobe illustrator',
             'indesign', 'photoshop', 'illustrator', 'editing', 'copywriting', 'graphic design', 'video editing',
-            'excel', 'power bi', 'sql', 'jira', 'confluence', 'sharepoint', 'wordpress'
+            'excel', 'power bi', 'sql', 'jira', 'confluence', 'sharepoint', 'wordpress', 'canva',
+            'microsoft word', 'database management', 'coordination', 'administration', 'community engagement',
+            'public relations', 'teaching', 'workshop facilitation', 'curriculum development', 'reporting',
+            'data analysis', 'financial management', 'risk management', 'compliance', 'policy development',
+            'negotiation', 'presentation skills', 'time management', 'organizational skills', 'attention to detail',
+            'creative thinking', 'cultural awareness', 'diversity and inclusion', 'relationship building'
         ]
+        
+        # Find matching skills
         found = []
         for kw in skill_keywords:
             pattern = r"\b" + re.escape(kw.replace('.', '\\.')) + r"\b"
             if re.search(pattern, normalized):
                 found.append(kw)
+        
+        # Deduplicate
         dedup = []
         seen = set()
         for kw in found:
             if kw not in seen:
                 seen.add(kw)
                 dedup.append(kw)
-        if not dedup:
-            return "", ""
-        dedup = dedup[:max_items]
-        skills_list = []
-        preferred_list = []
-        char_limit = 200
-        for item in dedup:
-            csv_try = (", ".join(skills_list + [item])).strip(', ')
-            if len(csv_try) <= char_limit:
-                skills_list.append(item)
-            else:
-                csv_try2 = (", ".join(preferred_list + [item])).strip(', ')
-                if len(csv_try2) <= char_limit:
-                    preferred_list.append(item)
+        
+        # If we don't have enough skills, add default arts industry skills
+        if len(dedup) < 10:
+            default_arts_skills = [
+                'communication', 'teamwork', 'planning', 'creative thinking', 'attention to detail',
+                'time management', 'organizational skills', 'cultural awareness', 'relationship building',
+                'project management', 'administration', 'coordination'
+            ]
+            for skill in default_arts_skills:
+                if skill not in seen and len(dedup) < 12:
+                    dedup.append(skill)
+                    seen.add(skill)
+        
+        # Ensure we have at least 10 items total to split
+        if len(dedup) < 10:
+            # Add more generic but relevant skills
+            generic_skills = ['microsoft word', 'excel', 'problem solving', 'customer service', 'marketing']
+            for skill in generic_skills:
+                if skill not in seen and len(dedup) < 10:
+                    dedup.append(skill)
+                    seen.add(skill)
+        
+        # Split into skills and preferred_skills (aim for 5-6 each)
+        mid_point = len(dedup) // 2
+        if mid_point < 4:
+            mid_point = min(5, len(dedup) // 2 + 2)
+        
+        skills_list = dedup[:mid_point]
+        preferred_list = dedup[mid_point:]
+        
+        # Ensure both have at least 4 items
+        if len(skills_list) < 4:
+            # Add items to skills_list from preferred_list or defaults
+            while len(skills_list) < 4 and len(dedup) >= 4:
+                if len(skills_list) < len(dedup):
+                    skills_list = dedup[:4]
+                    preferred_list = dedup[4:]
+                break
+        
+        if len(preferred_list) < 4:
+            # If preferred is too short, duplicate some skills from skills_list
+            extra_needed = 4 - len(preferred_list)
+            for i in range(extra_needed):
+                if i < len(skills_list):
+                    preferred_list.append(skills_list[i])
+        
+        # Limit to 6 items each maximum
+        skills_list = skills_list[:6]
+        preferred_list = preferred_list[:6]
+        
+        # Final fallback - ensure both have at least 4 items
+        if len(skills_list) < 4:
+            skills_list = ['communication', 'teamwork', 'planning', 'creative thinking']
+        if len(preferred_list) < 4:
+            preferred_list = ['organizational skills', 'attention to detail', 'time management', 'problem solving']
+        
         return ", ".join(skills_list), ", ".join(preferred_list)
     
     def map_job_type_from_badge(self, job_type_badge):
@@ -1109,181 +1196,190 @@ class ArtsHubAustraliaJobScraper:
             return None
     
     def save_job_to_database_sync(self, job_data):
-        """Save job to database (synchronous version for thread execution)."""
+        """Save job to StagingJob for ETL processing (synchronous version for thread execution)."""
         try:
-            with transaction.atomic():
-                # Check for duplicates by URL (only if URL is not empty)
-                if job_data.get('external_url') and job_data['external_url'].strip():
-                    existing_job = JobPosting.objects.filter(
-                        external_url=job_data['external_url']
-                    ).first()
-                    
-                    if existing_job:
-                        self.duplicates_found += 1
-                        self.logger.debug(f"Duplicate job found (URL): {job_data['title']}")
-                        return False
-                
-                # Alternative duplicate check by title + company
-                existing_job = JobPosting.objects.filter(
-                    title=job_data['title'],
-                    company__name=job_data['company_name'],
-                    external_source='artshub.com.au'
-                ).first()
-                
-                if existing_job:
-                    self.duplicates_found += 1
-                    self.logger.debug(f"Duplicate job found (title+company): {job_data['title']}")
-                    return False
-                
-                # Get or create company
-                company = self.get_or_create_company(job_data['company_name'])
-                if not company:
-                    self.logger.error(f"Failed to create company: {job_data['company_name']}")
-                    return False
-                # Update company logo if provided and missing or different
+            # Validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('external_url', '')
+            
+            if not job_title or not job_url:
+                self.logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.errors_count += 1
+                return False
+            
+            # Parse salary information
+            salary_min, salary_max, salary_currency, salary_type = self.parse_salary(job_data.get('salary_text', ''))
+            
+            # Parse date
+            date_posted = None
+            # Prefer absolute date from detail page
+            if job_data.get('posted_date_text'):
+                date_posted = self.parse_absolute_date(job_data.get('posted_date_text'))
+            if not date_posted:
+                date_posted = self.parse_date(job_data.get('date_posted_text', ''))
+            
+            # Convert date to string for JSON serialization
+            posted_date_str = ''
+            if date_posted:
+                if hasattr(date_posted, 'isoformat'):
+                    posted_date_str = date_posted.isoformat()
+                else:
+                    posted_date_str = str(date_posted)
+            
+            closing_date_str = job_data.get('closing_date') or job_data.get('closing_date_text', '')
+            
+            # Categorize job
+            job_category = JobCategorizationService.categorize_job(
+                job_data['title'], 
+                job_data.get('description', '')
+            )
+            
+            # Generate tags
+            tags_list = JobCategorizationService.get_job_keywords(
+                job_data['title'], 
+                job_data.get('description', '')
+            )
+            # Add arts-specific tags
+            arts_tags = ['arts', 'creative', 'culture']
+            if job_data.get('art_form'):
+                arts_tags.append(job_data['art_form'].lower())
+            if job_data.get('skills'):
+                skills_list = [skill.strip().lower() for skill in job_data['skills'].split(',')]
+                arts_tags.extend(skills_list)
+            tags_list.extend(arts_tags)
+            
+            # Extract skills from description
+            text_for_skills = (job_data.get('description', '') or '') + ' ' + (job_data.get('skills', '') or '')
+            skills_csv, preferred_csv = self.extract_skills_from_text(text_for_skills)
+            
+            # If extractor found nothing, fall back to tags
+            if not skills_csv and not preferred_csv:
+                candidate_list = []
                 try:
-                    logo_url = (job_data.get('company_logo') or '').strip()
-                    # Only update from card image for non-ArtsHub companies
-                    if logo_url and company.name != 'ArtsHub':
-                        if not company.logo or company.logo.strip() != logo_url:
-                            company.logo = logo_url
-                            company.save()
+                    candidate_list = [t for t in tags_list if t]
                 except Exception:
-                    pass
-                
-                # Get or create location
-                location = self.get_or_create_location(job_data['location'])
-                
-                # Parse salary information
-                salary_min, salary_max, salary_currency, salary_type = self.parse_salary(job_data.get('salary_text', ''))
-                
-                # Parse date
-                date_posted = None
-                # Prefer absolute date from detail page
-                if job_data.get('posted_date_text'):
-                    date_posted = self.parse_absolute_date(job_data.get('posted_date_text'))
-                if not date_posted:
-                    date_posted = self.parse_date(job_data.get('date_posted_text', ''))
-                
-                # Categorize job using your existing service (arts jobs will likely be 'other' but could be marketing, education, etc.)
-                job_category = JobCategorizationService.categorize_job(
-                    job_data['title'], 
-                    job_data.get('description', '')
-                )
-                
-                # Generate tags using your existing service
-                tags_list = JobCategorizationService.get_job_keywords(
-                    job_data['title'], 
-                    job_data.get('description', '')
-                )
-                # Add arts-specific tags
-                arts_tags = ['arts', 'creative', 'culture']
-                if job_data.get('art_form'):
-                    arts_tags.append(job_data['art_form'].lower())
-                if job_data.get('skills'):
-                    skills_list = [skill.strip().lower() for skill in job_data['skills'].split(',')]
-                    arts_tags.extend(skills_list)
-                tags_list.extend(arts_tags)
-                tags_str = ','.join(list(set(tags_list))[:15])  # Limit to 15 unique tags
-                
-                # Generate unique slug
-                base_slug = slugify(job_data['title'])
-                unique_slug = base_slug
-                counter = 1
-                while JobPosting.objects.filter(slug=unique_slug).exists():
-                    unique_slug = f"{base_slug}-{counter}"
-                    counter += 1
-                
-                # Handle external URL - if empty, make it unique using job data and timestamp
-                external_url = job_data.get('external_url', '').strip()
-                if not external_url:
-                    # Create a pseudo-URL to ensure uniqueness with timestamp
-                    timestamp = int(datetime.now().timestamp())
-                    external_url = f"https://artshub.com.au/job/{unique_slug}-{timestamp}/"
-                
-                # Extract skills from description for new fields (use card skills as fallback input)
-                text_for_skills = (job_data.get('description', '') or '') + ' ' + (job_data.get('skills', '') or '')
-                skills_csv, preferred_csv = self.extract_skills_from_text(text_for_skills)
-                # If extractor found nothing, fall back to our computed tags list and art form
-                if not skills_csv and not preferred_csv:
                     candidate_list = []
-                    try:
-                        candidate_list = [t for t in tags_list if t]
-                    except Exception:
-                        candidate_list = []
-                    # Include art form and classification hints
-                    for extra in [job_data.get('art_form'), job_data.get('job_type_badge'), job_category]:
-                        if extra and isinstance(extra, str):
-                            candidate_list.append(extra.strip())
-                    # Deduplicate while preserving order
-                    seen = set()
-                    ordered = []
-                    for it in candidate_list:
-                        low = it.lower()
-                        if low and low not in seen:
-                            seen.add(low)
-                            ordered.append(it)
-                    # Pack into two CSVs within 200 chars each
-                    s_list, p_list = [], []
-                    limit = 200
-                    for item in ordered:
-                        try_item = (', '.join(s_list + [item])).strip(', ')
-                        if len(try_item) <= limit:
-                            s_list.append(item)
-                        else:
-                            try_item2 = (', '.join(p_list + [item])).strip(', ')
-                            if len(try_item2) <= limit:
-                                p_list.append(item)
-                    skills_csv = ', '.join(s_list)
-                    preferred_csv = ', '.join(p_list)
-                # Absolute fallback: ensure both fields are non-empty
-                if not skills_csv and not preferred_csv:
-                    base = job_data.get('art_form') or job_category or 'general'
-                    base = str(base)[:200]
-                    skills_csv = base
-                    preferred_csv = base
-
-                # Create job posting
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'],
-                    slug=unique_slug,
-                    description=job_data.get('description_html') or job_data.get('description', ''),
-                    company=company,
-                    location=location,
-                    posted_by=self.bot_user,
-                    job_category=job_category,
-                    job_type=job_data.get('job_type', 'full_time'),
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_currency=salary_currency,
-                    salary_type=salary_type,
-                    salary_raw_text=job_data.get('salary_text', ''),
-                    external_source=job_data['external_source'],
-                    external_url=external_url,
-                    status='active',
-                    date_posted=date_posted,
-                    posted_ago=job_data.get('date_posted_text', ''),
-                    job_closing_date=job_data.get('closing_date') or job_data.get('closing_date_text', ''),
-                    skills=skills_csv or preferred_csv,
-                    preferred_skills=preferred_csv or skills_csv,
-                    tags=tags_str,
-                    additional_info={
-                        'scraper_version': 'ArtsHub-Playwright-Australia-1.0',
-                        'country': job_data['country'],
-                        'art_form': job_data.get('art_form', ''),
-                        'closing_date': job_data.get('closing_date', ''),
-                        'skills': job_data.get('skills', ''),
-                        'job_type_badge': job_data.get('job_type_badge', '')
-                    }
-                )
+                # Include art form and classification hints
+                for extra in [job_data.get('art_form'), job_data.get('job_type_badge'), job_category]:
+                    if extra and isinstance(extra, str):
+                        candidate_list.append(extra.strip())
+                # Deduplicate while preserving order
+                seen = set()
+                ordered = []
+                for it in candidate_list:
+                    low = it.lower()
+                    if low and low not in seen:
+                        seen.add(low)
+                        ordered.append(it)
+                # Pack into two CSVs within 200 chars each
+                s_list, p_list = [], []
+                limit = 200
+                for item in ordered:
+                    try_item = (', '.join(s_list + [item])).strip(', ')
+                    if len(try_item) <= limit:
+                        s_list.append(item)
+                    else:
+                        try_item2 = (', '.join(p_list + [item])).strip(', ')
+                        if len(try_item2) <= limit:
+                            p_list.append(item)
+                skills_csv = ', '.join(s_list)
+                preferred_csv = ', '.join(p_list)
+            
+            # Absolute fallback: ensure both fields are non-empty
+            if not skills_csv and not preferred_csv:
+                base = job_data.get('art_form') or job_category or 'arts'
+                base = str(base)[:200]
+                skills_csv = base
+                preferred_csv = base
+            
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'freelance': 'Freelance'
+            }
+            job_type = job_type_map.get(job_data.get('job_type', 'full_time'), 'Full-time')
+            
+            # Handle external URL - if empty, make it unique using job data and timestamp
+            external_url = job_url.strip()
+            if not external_url:
+                timestamp = int(datetime.now().timestamp())
+                external_url = f"https://artshub.com.au/job/{slugify(job_title)}-{timestamp}/"
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = external_url.split('/')[-2] if external_url.endswith('/') else external_url.split('/')[-1]
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_data.get('description_html') or job_data.get('description', ''),
+                'company_name': job_data.get('company_name', 'ArtsHub'),
+                'location': job_data.get('location', 'Australia'),
+                'salary': job_data.get('salary_text', ''),
+                'job_type': job_type,
+                'category': job_category,
+                'posted_ago': job_data.get('date_posted_text', ''),
                 
-                self.jobs_saved += 1
-                location_str = f" - {location.name}" if location else ""
-                self.logger.info(f"SAVED: {job_data['title']} at {job_data['company_name']}{location_str}")
-                return True
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': 'on_site',
+                'skills': skills_csv,
+                'preferred_skills': preferred_csv,
+                'closing_date': closing_date_str,
+                'posted_date': posted_date_str,
+                'experience_level': 'mid_level',
+                
+                # Store all raw data for ETL processing
+                'raw_artshub_data': {
+                    'salary_min': str(salary_min) if salary_min else '',
+                    'salary_max': str(salary_max) if salary_max else '',
+                    'salary_currency': salary_currency,
+                    'salary_type': salary_type,
+                    'art_form': job_data.get('art_form', ''),
+                    'job_type_badge': job_data.get('job_type_badge', ''),
+                    'company_logo': job_data.get('company_logo', ''),
+                    'tags': ','.join(list(set(tags_list))[:15]),
+                    'scraper_version': 'ArtsHub-Playwright-Australia-1.0-ETL',
+                    'country': job_data.get('country', 'Australia')
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='artshub.com.au',
+                job_url=external_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                self.logger.error(f"Failed to save to staging: {job_title}")
+                self.errors_count += 1
+                return False
+            
+            if not created:
+                self.logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.duplicates_found += 1
+                return "duplicate"
+            
+            # Success - log details
+            self.logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            self.logger.info(f"  Company: {staging_data['company_name']}")
+            self.logger.info(f"  Category: {staging_data['category']}")
+            self.logger.info(f"  Location: {staging_data['location']}")
+            self.logger.info(f"  Art Form: {job_data.get('art_form', 'Not specified')}")
+            self.logger.info(f"  Skills ({len(skills_csv.split(',')) if skills_csv else 0}): {skills_csv or 'Not specified'}")
+            
+            self.jobs_saved += 1
+            return True
                 
         except Exception as e:
-            self.logger.error(f"Error saving job: {e}")
+            self.logger.error(f"Error saving job to staging: {e}")
+            self.logger.exception(e)
             self.errors_count += 1
             return False
     
@@ -1619,66 +1715,333 @@ class ArtsHubAustraliaJobScraper:
         end_time = datetime.now()
         duration = end_time - start_time
         
-        print("\n" + "="*80)
-        print("ARTSHUB AUSTRALIA SCRAPING COMPLETED!")
-        print("="*80)
-        print(f"Duration: {duration}")
-        print(f"Jobs scraped: {self.jobs_scraped}")
-        print(f"Jobs saved: {self.jobs_saved}")
-        print(f"Duplicates skipped: {self.duplicates_found}")
-        print(f"Errors encountered: {self.errors_count}")
+        self.logger.info(f"ARTSHUB SCRAPING COMPLETED - Duration: {duration}")
+        self.logger.info(f"Jobs scraped: {self.jobs_scraped}, Jobs saved: {self.jobs_saved}, Duplicates: {self.duplicates_found}, Errors: {self.errors_count}")
         
         if self.jobs_scraped > 0:
             success_rate = (self.jobs_saved / self.jobs_scraped) * 100
-            print(f"Success rate: {success_rate:.1f}%")
+            self.logger.info(f"Success rate: {success_rate:.1f}%")
         
-        # Database statistics - run in thread to avoid async context issues
+        # Staging job statistics - run in thread to avoid async context issues
         try:
-            def get_stats():
-                return JobPosting.objects.filter(external_source='artshub.com.au').count()
+            from apps.jobs.models import StagingJob
+            
+            def get_staging_stats():
+                total = StagingJob.objects.filter(external_source='artshub.com.au').count()
+                pending = StagingJob.objects.filter(external_source='artshub.com.au', is_processed=False).count()
+                return total, pending
             
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(get_stats)
-                total_artshub_jobs = future.result()
-                print(f"Total ArtsHub Australia jobs in database: {total_artshub_jobs}")
+                future = executor.submit(get_staging_stats)
+                total_staging, pending_staging = future.result()
+                self.logger.info(f"Total ArtsHub jobs in staging: {total_staging}, Pending ETL: {pending_staging}")
         except Exception as e:
-            self.logger.error(f"Error getting database stats: {e}")
+            self.logger.error(f"Error getting staging stats: {e}")
+
+
+def reset_database():
+    """Reset/clear all ArtsHub Jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='artshub.com.au').count()
+            StagingJob.objects.filter(external_source='artshub.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} ArtsHub jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped ArtsHub jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.jobs_saved,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicates_found,  # Scraper duplicates
+                    'errors': scraper.errors_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='artshub.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending ArtsHub jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='artshub.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} ArtsHub jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='artshub.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='artshub.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
         
-        print("="*80)
+        today = timezone.now().date()
+        source = 'artshub.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.jobs_saved,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicates_found
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.jobs_saved,
+            total_processed=0,
+            total_duplicates=scraper.duplicates_found,
+            total_errors=scraper.errors_count,
+            new_skills_added=0,
+            status='success' if scraper.errors_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.jobs_saved}")
+        print(f"   Duplicates: {scraper.duplicates_found}")
+        print(f"   Errors: {scraper.errors_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
 
 
 def main():
     """Main function."""
-    print("Professional ArtsHub Australia Job Scraper (Playwright)")
-    print("="*60)
-    print("Advanced job scraper with professional database structure")
-    print("Optimized for Australian arts and creative industry")
-    print("="*60)
+    import argparse
     
     # Parse command line arguments
-    job_limit = None
+    parser = argparse.ArgumentParser(description='ArtsHub Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing ArtsHub jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    if len(sys.argv) > 1:
-        try:
-            job_limit = int(sys.argv[1])
-            print(f"Job limit set to: {job_limit}")
-        except ValueError:
-            print("Warning: Invalid job limit. Using unlimited.")
+    args = parser.parse_args()
+    
+    logger = logging.getLogger(__name__)
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing ArtsHub jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    job_limit = args.job_limit
+    if job_limit:
+        logger.info(f"Job limit set to: {job_limit}")
+    else:
+        logger.info("Job limit: unlimited")
     
     # Initialize and run scraper
-    scraper = ArtsHubAustraliaJobScraper(job_limit=job_limit)
-    scraper.run_scraping()
+    try:
+        scraper = ArtsHubAustraliaJobScraper(job_limit=job_limit)
+        scraper.run_scraping()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 def run(job_limit=200):
-    """Automation entrypoint for ArtsHub Australia scraper."""
+    """Automation entrypoint for ArtsHub Australia scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
+    """
     try:
+        # Run scraping
         scraper = ArtsHubAustraliaJobScraper(job_limit=job_limit)
         summary = scraper.run_scraping()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'summary': summary,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'summary': summary,
-            'message': 'ArtsHub scraping completed'
+            'message': 'ArtsHub scraping and ETL completed'
         }
     except SystemExit as e:
         return {

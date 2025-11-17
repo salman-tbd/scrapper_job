@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Professional ACT Government Job Scraper
-=======================================
+Professional ACT Government Job Scraper with ETL Pipeline
+==========================================================
 
-Advanced scraper for ACT Government careers website (https://www.jobs.act.gov.au/opportunities/all) that integrates with 
-your existing job scraper project database structure:
+Advanced scraper for ACT Government careers website (https://www.jobs.act.gov.au/opportunities/all) 
+that follows the ETL pipeline architecture:
 
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. PortalJob is the FINAL public model (no JobPosting model)
+
+Scraper Features:
 - Uses Playwright for modern, reliable web scraping
-- Professional database structure (JobPosting, Company, Location)
+- Saves raw data to StagingJob table (ETL first stage)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
-- Enhanced duplicate detection
+- Enhanced duplicate detection in staging
 - Comprehensive error handling and logging
 - Thread-safe database operations
 - ACT Government job portal optimization
 
-This scraper handles the ACT Government's official job portal which features:
+ACT Government Portal Features:
 - Government departments and agencies
 - Rich job information including salary ranges and position numbers
 - Multiple work types and classifications
@@ -28,13 +36,22 @@ Features:
 - 🛡️ Duplicate detection and data validation
 - 📈 Detailed scraping statistics and summaries
 - 🔄 Professional government job categorization
+- ✅ ETL-ready data saved to StagingJob table
 
 Usage:
-    python act_government_scraper_advanced.py [job_limit]
+    python act_government_scraper_advanced.py [job_limit] [--auto-etl]
     
 Examples:
-    python act_government_scraper_advanced.py 50    # Scrape 50 jobs
-    python act_government_scraper_advanced.py       # Scrape all available jobs
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python act_government_scraper_advanced.py --auto-etl           # Scrape all + auto ETL
+    python act_government_scraper_advanced.py 50 --auto-etl       # Scrape 50 + auto ETL
+    
+    # Two-step manual process
+    python act_government_scraper_advanced.py 50                  # Scrape only
+    python manage.py run_etl_pipeline --source=jobs.act.gov.au   # Then run ETL
+    
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -61,10 +78,10 @@ from django.contrib.auth import get_user_model
 from django.utils.text import slugify
 from playwright.sync_api import sync_playwright
 
-from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -1389,158 +1406,126 @@ class ACTGovernmentJobScraper:
             return 'Communication, Microsoft Office', 'Project Management'
     
     def save_job_to_database_sync(self, job_data):
-        """Synchronous database save function."""
+        """Save job data to StagingJob for ETL processing."""
         try:
             # Close any existing connections
             connections.close_all()
             
-            with transaction.atomic():
-                # Enhanced duplicate detection
-                job_title = job_data.get('title', '')
-                position_number = job_data.get('position_number', '')
-                department = job_data.get('department', 'ACT Government')
+            # Enhanced validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('url', '')
+            position_number = job_data.get('position_number', '')
+            
+            if not job_title or not job_url:
+                self.logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                return False
+            
+            # Use provided description or create one from job data
+            if job_data.get('description'):
+                description = job_data['description']
+            else:
+                description = self.generate_fallback_description(job_data)
+            
+            # Validate and clean job data before saving
+            if not self.validate_job_data(job_title, description):
+                self.logger.warning(f"Job data validation failed for: {job_title}")
+                return False
+            
+            # Map department to company name
+            department = job_data.get('department', 'ACT Government')
+            company_name = self.act_departments.get(department.lower(), department)
+            
+            # Parse location for ACT
+            location_name, city, state, country = self.parse_location("Canberra, ACT")
+            location_str = f"{city}, {state}, {country}"
+            
+            # Determine job type from employment_type
+            job_type = "Full-time"  # Default
+            employment_type = job_data.get('employment_type', '').lower()
+            if 'part-time' in employment_type or 'part time' in employment_type:
+                job_type = "Part-time"
+            elif 'casual' in employment_type:
+                job_type = "Casual"
+            elif 'contract' in employment_type:
+                job_type = "Contract"
+            elif 'temporary' in employment_type:
+                job_type = "Temporary"
+            
+            # Determine job category
+            job_category = self.determine_job_category(
+                job_title,
+                job_data.get('employment_grade', ''),
+                company_name
+            )
+            
+            # Generate skills from description
+            skills_str, preferred_skills_str = self.generate_skills_from_description(job_title, description)
+            
+            # Prepare data for staging in the format expected by save_to_staging
+            staging_data = {
+                'title': job_title,
+                'description': description,
+                'company_name': company_name,
+                'location': location_str,
+                'salary': job_data.get('salary_grade', ''),
+                'job_type': job_type,
+                'category': job_category,
+                'posted_ago': job_data.get('advertised_date', ''),
                 
-                # Check for position number duplicate (most reliable for government jobs)
-                if position_number and JobPosting.objects.filter(external_id=position_number).exists():
-                    self.logger.info(f"Duplicate job skipped (Position Number): {job_title}")
-                    self.duplicates_found += 1
-                    return False
+                # Additional ACT Government specific data
+                'employment_type': job_data.get('employment_type', ''),
+                'employment_grade': job_data.get('employment_grade', ''),
+                'position_number': position_number,
+                'closing_date': job_data.get('closing_date', ''),
+                'department': department,
+                'work_mode': 'on_site',
+                'skills': skills_str,
+                'preferred_skills': preferred_skills_str,
                 
-                # Check for title + department duplicate
-                if JobPosting.objects.filter(title=job_title, company__name__icontains=department).exists():
-                    self.logger.info(f"Duplicate job skipped (Title+Department): {job_title}")
-                    self.duplicates_found += 1
-                    return False
-                
-                # Parse and create location (ACT specific)
-                location_name, city, state, country = self.parse_location("Canberra, ACT")
-                location_obj, created = Location.objects.get_or_create(
-                    name=location_name,
-                    defaults={
-                        'city': city,
-                        'state': state,
-                        'country': country
-                    }
-                )
-                
-                # Map department to company name
-                company_name = self.act_departments.get(department.lower(), department)
-                
-                # Get or create company
-                company_slug = slugify(company_name)
-                company_obj, created = Company.objects.get_or_create(
-                    slug=company_slug,
-                    defaults={
-                        'name': company_name,
-                        'description': f'{company_name} - ACT Government careers',
-                        'website': self.base_url,
-                        'company_size': 'enterprise'  # Government is enterprise size
-                    }
-                )
-                
-                # Parse salary from salary_grade
-                salary_min, salary_max, currency, salary_type, raw_text = self.parse_salary(
-                    job_data.get('salary_grade', '')
-                )
-                
-                # Parse dates
-                date_posted = None
-                closing_date = self.parse_date(job_data.get('closing_date', ''))
-                
-                # Determine job type from employment_type
-                job_type = "full_time"  # Default
-                employment_type = job_data.get('employment_type', '').lower()
-                if 'part-time' in employment_type or 'part time' in employment_type:
-                    job_type = "part_time"
-                elif 'casual' in employment_type:
-                    job_type = "casual"
-                elif 'contract' in employment_type:
-                    job_type = "contract"
-                elif 'temporary' in employment_type:
-                    job_type = "temporary"
-                
-                # Determine job category
-                job_category = self.determine_job_category(
-                    job_data.get('title', ''),
-                    job_data.get('employment_grade', ''),
-                    company_name
-                )
-                
-                # Create unique slug
-                base_slug = slugify(job_data.get('title', 'job'))
-                unique_slug = base_slug
-                counter = 1
-                while JobPosting.objects.filter(slug=unique_slug).exists():
-                    unique_slug = f"{base_slug}-{counter}"
-                    counter += 1
-                
-                # Use provided description or create one from job data
-                if job_data.get('description'):
-                    description = job_data['description']
-                else:
-                    description = self.fetch_detailed_description(job_data, None)
-                
-                # Validate and clean job data before saving
-                job_title = job_data.get('title', '').strip()
-                if not self.validate_job_data(job_title, description):
-                    self.logger.warning(f"Job data validation failed for: {job_title}")
-                    return False
-                
-                # Generate skills from description
-                skills_str, preferred_skills_str = self.generate_skills_from_description(job_title, description)
-                
-                # Create JobPosting
-                job_posting = JobPosting.objects.create(
-                    title=job_data.get('title', ''),
-                    slug=unique_slug,
-                    description=description,
-                    company=company_obj,
-                    posted_by=self.bot_user,
-                    location=location_obj,
-                    job_category=job_category,
-                    job_type=job_type,
-                    experience_level=job_data.get('salary_grade', ''),
-                    work_mode='on_site',  # Government jobs are typically on-site
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_currency=currency,
-                    salary_type=salary_type,
-                    salary_raw_text=raw_text,
-                    external_source='jobs.act.gov.au',
-                    external_url=job_data.get('url', f"{self.search_url}#{slugify(job_data.get('title', ''))}"),
-                    external_id=job_data.get('position_number', ''),
-                    status='active',
-                    posted_ago='',
-                    date_posted=date_posted,
-                    tags=job_data.get('department', ''),
-                    job_closing_date=job_data.get('closing_date', ''),
-                    skills=skills_str,
-                    preferred_skills=preferred_skills_str,
-                    additional_info={
-                        'employment_type': job_data.get('employment_type', ''),
-                        'employment_grade': job_data.get('employment_grade', ''),
-                        'position_number': job_data.get('position_number', ''),
-                        'closing_date': job_data.get('closing_date', ''),
-                        'department': job_data.get('department', ''),
-                        'advertised_date': job_data.get('advertised_date', ''),
-                        'salary_data': job_data.get('salary_data', ''),
-                        'scraper_version': '2.1'
-                    }
-                )
-                
-                self.logger.info(f"Saved job: {job_posting.title} at {job_posting.company.name}")
-                self.logger.info(f"  Category: {job_posting.job_category}")
-                self.logger.info(f"  Location: {job_posting.location.name}")
-                self.logger.info(f"  Salary: {job_posting.salary_display}")
-                self.logger.info(f"  Closing Date: {job_posting.job_closing_date or 'Not specified'}")
-                self.logger.info(f"  Skills: {job_posting.skills or 'Not specified'}")
-                self.logger.info(f"  Preferred Skills: {job_posting.preferred_skills or 'Not specified'}")
-                
-                self.jobs_saved += 1
-                return True
+                # Store all raw data for ETL processing
+                'raw_act_data': {
+                    'salary_data': job_data.get('salary_data', ''),
+                    'closing_date_data': job_data.get('closing_date_data', ''),
+                    'advertised_date': job_data.get('advertised_date', ''),
+                    'scraper_version': '2.1',
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='jobs.act.gov.au',
+                job_url=job_url,
+                job_data=staging_data,
+                external_id=position_number
+            )
+            
+            if not staging_job:
+                self.logger.error(f"Failed to save to staging: {job_title}")
+                self.errors_count += 1
+                return False
+            
+            if not created:
+                self.logger.info(f"Duplicate job skipped: {job_title}")
+                self.duplicates_found += 1
+                return False
+            
+            # Success - log details
+            self.logger.info(f"✅ Saved to staging: {job_title}")
+            self.logger.info(f"  Company: {company_name}")
+            self.logger.info(f"  Department: {department}")
+            self.logger.info(f"  Category: {job_category}")
+            self.logger.info(f"  Location: {location_str}")
+            self.logger.info(f"  Position Number: {position_number or 'Not specified'}")
+            self.logger.info(f"  Closing Date: {job_data.get('closing_date', 'Not specified')}")
+            self.logger.info(f"  Skills: {skills_str or 'Not specified'}")
+            self.logger.info(f"  Preferred Skills: {preferred_skills_str or 'Not specified'}")
+            
+            self.jobs_saved += 1
+            return True
                 
         except Exception as e:
-            self.logger.error(f"Error saving job to database: {str(e)}")
+            self.logger.error(f"Error saving job to staging: {str(e)}")
+            self.logger.exception(e)
             self.errors_count += 1
             return False
     
@@ -1669,52 +1654,261 @@ class ACTGovernmentJobScraper:
         self.logger.info("=" * 60)
         self.logger.info(f"Pages scraped: {self.pages_scraped}")
         self.logger.info(f"Jobs processed: {self.jobs_scraped}")
-        self.logger.info(f"Jobs saved to database: {self.jobs_saved}")
+        self.logger.info(f"Jobs saved to staging: {self.jobs_saved}")
         self.logger.info(f"Duplicates found: {self.duplicates_found}")
         self.logger.info(f"Errors encountered: {self.errors_count}")
+        self.logger.info("")
+        self.logger.info("✅ ETL FLOW: Jobs saved to StagingJob table")
+        self.logger.info("📊 Next Step: Run ETL processing to transform data")
+        self.logger.info("    StagingJob → VaultJob + PortalJob + SkillMaster")
         
-        # Get total job count
+        # Get staging job count
         try:
+            from apps.jobs.models import StagingJob
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(lambda: JobPosting.objects.count())
-                total_jobs_in_db = future.result(timeout=10)
-                self.logger.info(f"Total job postings in database: {total_jobs_in_db}")
-        except:
-            self.logger.info("Total job postings in database: (count unavailable)")
+                future = executor.submit(lambda: StagingJob.objects.filter(external_source='jobs.act.gov.au').count())
+                total_staging_jobs = future.result(timeout=10)
+                self.logger.info(f"\nTotal ACT Government jobs in staging: {total_staging_jobs}")
+                
+                future2 = executor.submit(lambda: StagingJob.objects.filter(external_source='jobs.act.gov.au', is_processed=False).count())
+                pending_jobs = future2.result(timeout=10)
+                self.logger.info(f"Pending ETL processing: {pending_jobs}")
+        except Exception as e:
+            self.logger.info(f"Staging job count: (unavailable - {e})")
         
         self.logger.info("=" * 60)
 
 
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped ACT Government jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob + SkillMaster...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.jobs_saved,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicates_found,  # Scraper duplicates
+                    'errors': scraper.errors_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='jobs.act.gov.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending ACT Government jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='jobs.act.gov.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} ACT Government jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='jobs.act.gov.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='jobs.act.gov.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _create_summary_in_thread():
+        """Create summary in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import JobIngestionSummary
+            from django.utils import timezone
+            
+            today = timezone.now().date()
+            source = 'jobs.act.gov.au'
+            
+            # Create NEW record for each execution (not get_or_create)
+            source_breakdown = {
+                source: {
+                    'scraped': scraper.jobs_saved,
+                    'processed': 0,
+                    'failed': 0,
+                    'duplicates': scraper.duplicates_found
+                }
+            }
+            
+            summary = JobIngestionSummary.objects.create(
+                summary_date=today,
+                source=source,  # Add source field
+                execution_started_at=timezone.now(),
+                execution_finished_at=timezone.now(),
+                total_scraped=scraper.jobs_saved,
+                total_processed=0,
+                total_duplicates=scraper.duplicates_found,
+                total_errors=scraper.errors_count,
+                new_skills_added=0,
+                status='success' if scraper.errors_count == 0 else 'partial',
+                source_breakdown=source_breakdown
+            )
+            
+            print("")
+            print("=" * 70)
+            print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+            print(f"   Source: {source}")
+            print(f"   Scraped: {scraper.jobs_saved}")
+            print(f"   Duplicates: {scraper.duplicates_found}")
+            print(f"   Errors: {scraper.errors_count}")
+            print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+            print("=" * 70)
+            
+        except Exception as e:
+            print(f"⚠️  Could not create JobIngestionSummary: {e}")
+    
+    # Execute in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_create_summary_in_thread)
+            future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to create scraping summary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function to run the scraper."""
-    print("🔍 ACT Government Job Scraper")
-    print("=" * 60)
-    
     # Show usage if help requested
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help', 'help']:
-        print("Usage: python act_government_scraper_advanced.py [job_limit]")
-        print("")
-        print("Arguments:")
-        print("  job_limit   : Maximum number of jobs to scrape (optional)")
-        print("")
-        print("Examples:")
-        print("  python act_government_scraper_advanced.py              # Scrape all jobs")
-        print("  python act_government_scraper_advanced.py 50          # Scrape up to 50 jobs")
+        print("Usage: python act_government_scraper_advanced.py [job_limit] [--auto-etl]")
         return
     
     # Parse command line arguments
     job_limit = None
+    auto_etl = '--auto-etl' in sys.argv
     
-    if len(sys.argv) > 1:
+    for arg in sys.argv[1:]:
+        if arg == '--auto-etl':
+            continue
         try:
-            job_limit = int(sys.argv[1])
+            job_limit = int(arg)
         except ValueError:
-            print("Invalid job limit. Using no limit.")
-    
-    print(f"Target: ACT Government careers (jobs.act.gov.au)")
-    print(f"Job limit: {job_limit or 'No limit'}")
-    print(f"Database: Professional structure with JobPosting, Company, Location")
-    print("=" * 60)
+            pass
     
     # Create scraper instance
     scraper = ACTGovernmentJobScraper(job_limit=job_limit)
@@ -1723,15 +1917,26 @@ def main():
         # Run the scraping process
         scraper.run()
         
+        # Run ETL if auto-etl flag is set
+        if auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+        
     except KeyboardInterrupt:
-        print("\nScraping interrupted by user")
+        print("Interrupted")
     except Exception as e:
-        print(f"Scraping failed: {str(e)}")
+        print(f"Failed: {str(e)}")
         raise
 
 
 def run():
-    """Entry point for scheduler system."""
+    """Entry point for scheduler system - auto-runs ETL."""
+    import sys
+    # Add --auto-etl flag for scheduler
+    if '--auto-etl' not in sys.argv:
+        sys.argv.append('--auto-etl')
     return main()
 
 

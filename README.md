@@ -6,7 +6,7 @@ It’s concise enough for onboarding but detailed enough that new engineers (or 
 
 # 🧩 Evol Job Scraper & Centralised Job Portal
 
-**Stack:** Python 3.11+, FastAPI, PostgreSQL, Docker
+**Stack:** Python 3.11+, Django REST API , PostgreSQL, Docker
 **Purpose:** Automate job scraping, anonymise employer data, extract skills, and display enriched listings in a centralised portal.
 
 ---
@@ -37,7 +37,7 @@ Selenium Scrapers → staging_jobs → ETL Pipeline
                         ↓
          skill_master + job_ingestion_summary
                         ↓
-                FastAPI Admin Endpoint
+                DRF Admin Endpoint
 ```
 
 ---
@@ -48,7 +48,7 @@ Selenium Scrapers → staging_jobs → ETL Pipeline
 | --------------------------- | ------------------------------------------------------ |
 | `etl/etl_jobs.py`           | Core ETL pipeline (staging → vault → portal)           |
 | `etl/daily_summary.py`      | Writes daily ETL summaries                             |
-| `etl/api/etl_api.py`        | FastAPI endpoint to trigger ETL manually               |
+| `etl/api/etl_api.py`        | DRF endpoint to trigger ETL manually               |
 | `etl/utils/`                | Shared modules (logger, skill extractor, text cleaner) |
 | `docker/docker-compose.yml` | Defines db, etl, and api containers                    |
 | `docs/etl_project_guide.md` | Detailed architecture documentation                    |
@@ -69,7 +69,7 @@ This starts:
 
 * `db` — PostgreSQL 15
 * `etl` — Python service running the ETL pipeline
-* `api` — FastAPI service on port 8000
+* `api` — DRFAPI service on port 8000
 
 ### **Stop containers**
 
