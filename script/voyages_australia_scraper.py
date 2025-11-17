@@ -1,23 +1,47 @@
 #!/usr/bin/env python
 """
-Professional Voyages.com.au Job Scraper using Playwright
+Professional Voyages.com.au Job Scraper using Playwright with ETL Pipeline
 
 This script scrapes job postings from Voyages Indigenous Tourism Australia's careers page
-and stores them in the professional database structure with JobPosting, Company, and Location models.
+and integrates with the ETL pipeline for professional data processing.
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
 
 Features:
+- Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
 - Professional database structure with proper relationships
-- Automatic job categorization using keyword matching
+- Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
 - Complete data extraction and normalization
-- Playwright for modern web scraping
 - Handles all job listings from Voyages careers page
+- ETL-ready data saved to StagingJob table
 
 Usage:
-    python voyages_australia_scraper.py [max_jobs]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python voyages_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python voyages_australia_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python voyages_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=voyages.com.au  # Then run ETL
+    
+    # Other options
+    python voyages_australia_scraper.py 100 --reset          # Clear staging first
+    python voyages_australia_scraper.py                      # Scrape all jobs
 
-Example:
-    python voyages_australia_scraper.py 50
+Examples:
+    python voyages_australia_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python voyages_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python voyages_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -31,6 +55,7 @@ from urllib.parse import urljoin, urlparse
 import logging
 from decimal import Decimal
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 # Set up Django environment
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'australia_job_scraper.settings_dev')
@@ -59,6 +84,8 @@ from playwright.sync_api import sync_playwright
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.models import JobPosting
+from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 # Configure logging
 logging.basicConfig(
@@ -83,6 +110,9 @@ class VoyagesScraper:
         self.base_url = "https://www.voyages.com.au"
         self.careers_url = "https://www.voyages.com.au/careers/positions-available"
         self.scraped_count = 0
+        self.jobs_saved = 0
+        self.duplicates_found = 0
+        self.errors_count = 0
         self.company = None
         self.scraper_user = None
         self._current_job_page_content = None
@@ -468,72 +498,143 @@ class VoyagesScraper:
             logger.error(f"Error extracting job data: {str(e)}")
             return None
             
-    def save_job_to_database(self, job_data):
-        """Save job data to database with proper relationships."""
+    def save_job_to_database_sync(self, job_data):
+        """Save job to StagingJob for ETL processing (synchronous version for thread execution)."""
         try:
-            with transaction.atomic():
-                # Get or create location
-                location = self.get_or_create_location(job_data['location_text'])
+            # Validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('external_url', '')
+            
+            if not job_title or not job_url:
+                logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.errors_count += 1
+                return False
+            
+            # Categorize job using JobCategorizationService
+            job_category = JobCategorizationService.categorize_job(
+                job_data['title'], 
+                job_data.get('description', '')
+            )
+            
+            # Generate tags
+            tags_list = JobCategorizationService.get_job_keywords(
+                job_data['title'], 
+                job_data.get('description', '')
+            )
+            
+            # Add department as tag
+            if job_data.get('department'):
+                tags_list.append(job_data['department'])
+            
+            # Normalize job type
+            job_type_raw = self.normalize_job_type(job_data.get('job_type_text', ''))
+            
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'freelance': 'Freelance'
+            }
+            job_type = job_type_map.get(job_type_raw, 'Full-time')
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = job_data.get('external_id', f"voyages_{hash(job_url + job_title)}")
+            
+            # Get skills from job_data (already extracted in scraping)
+            skills_csv = job_data.get('skills', '')
+            preferred_csv = job_data.get('preferred_skills', '')
+            
+            # Fallback: ensure both fields are non-empty
+            if not skills_csv and not preferred_csv:
+                base = job_data.get('department') or job_category or 'hospitality'
+                base = str(base)[:200]
+                skills_csv = base
+                preferred_csv = base
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_data.get('description', ''),
+                'company_name': 'Voyages Indigenous Tourism Australia',
+                'location': job_data.get('location_text', 'Australia'),
+                'salary': job_data.get('salary_info', ''),
+                'job_type': job_type,
+                'category': job_category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                # Categorize job
-                job_category = self.categorize_job(job_data['title'], job_data['description'])
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': 'on_site',  # Voyages jobs are typically on-site
+                'skills': skills_csv,
+                'preferred_skills': preferred_csv,
+                'closing_date': job_data.get('closing_date', ''),
+                'posted_date': '',
+                'experience_level': 'mid_level',
                 
-                # Normalize job type
-                job_type = self.normalize_job_type(job_data['job_type_text'])
-                
-                # Check if job already exists (by title and company)
-                existing_job = JobPosting.objects.filter(
-                    title=job_data['title'],
-                    company=self.company
-                ).first()
-                
-                if existing_job:
-                    logger.info(f"Job already exists: {job_data['title']}")
-                    return existing_job
-                
-                # Create new job posting
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'],
-                    description=job_data['description'],
-                    company=self.company,
-                    posted_by=self.scraper_user,
-                    location=location,
-                    job_category=job_category,
-                    job_type=job_type,
-                    experience_level='',
-                    work_mode='On-site',  # Voyages jobs are typically on-site
-                    external_source='voyages.com.au',
-                    external_url=job_data['external_url'],
-                    external_id=job_data['external_id'],
-                    status='active',
-                    posted_ago=job_data['posted_ago'],
-                    date_posted=timezone.now(),  # Use current time since no posting date available
-                    tags=job_data['department'],  # Use department as tags
-                    job_closing_date=job_data.get('closing_date'),  # Store closing date in dedicated field
-                    skills=job_data.get('skills', ''),  # Store extracted skills
-                    preferred_skills=job_data.get('preferred_skills', ''),  # Store extracted preferred skills
-                    additional_info={
-                        'department': job_data['department'],
-                        'job_type_raw': job_data['job_type_text'],
-                        'location_raw': job_data['location_text'],
-                        'scraped_from': 'voyages_careers_page',
-                        'scraper_version': '2.0'  # Updated version to reflect new features
-                    }
-                )
-                
-                logger.info(f"Saved job to database: {job_posting.title} (ID: {job_posting.id})")
-                return job_posting
+                # Store all raw data for ETL processing
+                'raw_voyages_data': {
+                    'department': job_data.get('department', ''),
+                    'job_type_raw': job_data.get('job_type_text', ''),
+                    'location_raw': job_data.get('location_text', ''),
+                    'tags': ','.join(list(set(tags_list))[:15]),
+                    'scraper_version': 'Voyages-Playwright-Australia-2.0-ETL',
+                    'country': 'Australia',
+                    'scraped_from': 'voyages_careers_page'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='voyages.com.au',
+                job_url=job_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                self.errors_count += 1
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.duplicates_found += 1
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            logger.info(f"  Company: Voyages Indigenous Tourism Australia")
+            logger.info(f"  Category: {staging_data['category']}")
+            logger.info(f"  Location: {staging_data['location']}")
+            logger.info(f"  Department: {job_data.get('department', 'Not specified')}")
+            logger.info(f"  Skills ({len(skills_csv.split(',')) if skills_csv else 0}): {skills_csv or 'Not specified'}")
+            
+            self.jobs_saved += 1
+            return True
                 
         except Exception as e:
-            logger.error(f"Error saving job to database: {str(e)}")
-            return None
+            logger.error(f"Error saving job to staging: {e}")
+            logger.exception(e)
+            self.errors_count += 1
+            return False
+    
+    def save_job_to_database(self, job_data):
+        """Save job to database using thread to avoid async context issues."""
+        def run_in_thread():
+            return self.save_job_to_database_sync(job_data)
+        
+        # Use ThreadPoolExecutor to run database operation in separate thread
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_in_thread)
+            return future.result()
             
     def scrape_jobs(self):
         """Main scraping method using Playwright."""
         logger.info("Starting Voyages job scraping...")
-        
-        # Setup database objects
-        self.setup_database_objects()
         
         with sync_playwright() as p:
             # Launch browser
@@ -1933,71 +2034,384 @@ class VoyagesScraper:
             found_skills = set(main_skills)
             preferred_skills = set(pref_skills)
         
+        # If we don't have enough skills, add default hospitality/tourism skills
+        all_found = list(found_skills) + list(preferred_skills)
+        if len(all_found) < 10:
+            default_hospitality_skills = [
+                'communication', 'customer service', 'teamwork', 'attention to detail', 'time management',
+                'organizational skills', 'flexibility', 'cultural awareness', 'problem solving',
+                'reliability', 'multitasking', 'professional'
+            ]
+            for skill in default_hospitality_skills:
+                if skill not in [s.lower() for s in all_found] and len(all_found) < 12:
+                    if len(list(found_skills)) <= len(list(preferred_skills)):
+                        found_skills.add(skill.title())
+                    else:
+                        preferred_skills.add(skill.title())
+                    all_found.append(skill)
+        
+        # Convert to lists for better manipulation
+        skills_list = sorted(list(found_skills))
+        preferred_list = sorted(list(preferred_skills))
+        
+        # Ensure we have at least 10 items total to split properly
+        combined = skills_list + preferred_list
+        if len(combined) < 10:
+            # Add more generic but relevant skills
+            generic_skills = ['microsoft office', 'excel', 'word', 'cash handling', 'food safety', 'rsa']
+            for skill in generic_skills:
+                if skill not in [s.lower() for s in combined] and len(combined) < 10:
+                    combined.append(skill.title())
+        
+        # Split into skills and preferred_skills ensuring 4-6 each minimum
+        if len(combined) > 0:
+            mid_point = len(combined) // 2
+            if mid_point < 4:
+                mid_point = min(5, len(combined) // 2 + 2)
+            
+            skills_list = combined[:mid_point]
+            preferred_list = combined[mid_point:]
+            
+            # Ensure both have at least 4 items
+            if len(skills_list) < 4:
+                while len(skills_list) < 4 and len(combined) >= 4:
+                    if len(skills_list) < len(combined):
+                        skills_list = combined[:4]
+                        preferred_list = combined[4:]
+                    break
+            
+            if len(preferred_list) < 4:
+                # If preferred is too short, duplicate some skills from skills_list
+                extra_needed = 4 - len(preferred_list)
+                for i in range(extra_needed):
+                    if i < len(skills_list):
+                        preferred_list.append(skills_list[i])
+            
+            # Limit to 6 items each maximum
+            skills_list = skills_list[:6]
+            preferred_list = preferred_list[:6]
+        
+        # Final fallback - ensure both have at least 4 items
+        if len(skills_list) < 4:
+            skills_list = ['Communication', 'Customer Service', 'Teamwork', 'Attention To Detail']
+        if len(preferred_list) < 4:
+            preferred_list = ['Time Management', 'Organizational Skills', 'Flexibility', 'Cultural Awareness']
+        
         # Convert to comma-separated strings (max 200 chars each as per model)
-        skills_str = ', '.join(sorted(found_skills))[:200] if found_skills else ''
-        preferred_skills_str = ', '.join(sorted(preferred_skills))[:200] if preferred_skills else ''
+        skills_str = ', '.join(skills_list)[:200]
+        preferred_skills_str = ', '.join(preferred_list)[:200]
         
-        # Ensure we have at least some skills in both fields if we found any skills at all
-        if all_found_skills and not skills_str:
-            # Move some from preferred back to required
-            pref_list = list(preferred_skills)
-            if len(pref_list) > 2:
-                skills_str = ', '.join(pref_list[:len(pref_list)//2])[:200]
-                preferred_skills_str = ', '.join(pref_list[len(pref_list)//2:])[:200]
-        elif all_found_skills and not preferred_skills_str:
-            # Move some from required to preferred
-            req_list = list(found_skills)
-            if len(req_list) > 2:
-                skills_str = ', '.join(req_list[:len(req_list)//2])[:200]
-                preferred_skills_str = ', '.join(req_list[len(req_list)//2:])[:200]
-        
-        logger.info(f"Extracted skills: {skills_str}")
-        logger.info(f"Extracted preferred skills: {preferred_skills_str}")
+        logger.info(f"Extracted skills ({len(skills_list)}): {skills_str}")
+        logger.info(f"Extracted preferred skills ({len(preferred_list)}): {preferred_skills_str}")
         
         return skills_str, preferred_skills_str
 
 
+def reset_database():
+    """Reset/clear all Voyages Jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='voyages.com.au').count()
+            StagingJob.objects.filter(external_source='voyages.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} Voyages jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Voyages jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.jobs_saved,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicates_found,  # Scraper duplicates
+                    'errors': scraper.errors_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='voyages.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending Voyages jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='voyages.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} Voyages jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='voyages.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='voyages.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'voyages.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.jobs_saved,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicates_found
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.jobs_saved,
+            total_processed=0,
+            total_duplicates=scraper.duplicates_found,
+            total_errors=scraper.errors_count,
+            new_skills_added=0,
+            status='success' if scraper.errors_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.jobs_saved}")
+        print(f"   Duplicates: {scraper.duplicates_found}")
+        print(f"   Errors: {scraper.errors_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function to run the scraper."""
-    # Get max jobs from command line argument
-    max_jobs = None
-    if len(sys.argv) > 1:
-        try:
-            max_jobs = int(sys.argv[1])
-        except ValueError:
-            logger.error("Invalid max_jobs argument. Please provide a number.")
-            sys.exit(1)
+    import argparse
     
-    logger.info(f"Starting Voyages scraper (max_jobs: {max_jobs or 'unlimited'})")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Voyages Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Voyages jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    # Create and run scraper
-    scraper = VoyagesScraper(max_jobs=max_jobs, headless=True)
+    args = parser.parse_args()
     
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Voyages jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    job_limit = args.job_limit
+    if job_limit:
+        logger.info(f"Job limit set to: {job_limit}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    # Initialize and run scraper
     try:
+        scraper = VoyagesScraper(max_jobs=job_limit, headless=True)
         jobs_scraped = scraper.scrape_jobs()
         logger.info(f"Scraping completed successfully. Jobs scraped: {jobs_scraped}")
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
         
         # Close database connections
         connections.close_all()
         
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
     except Exception as e:
         logger.error(f"Scraping failed: {str(e)}")
-        sys.exit(1)
+        raise
 
 
 def run(max_jobs=None):
-    """Automation entrypoint for Voyages scraper.
-
-    Creates the scraper and runs it without relying on CLI. Returns a summary dict
-    for schedulers (e.g., Celery) similar to the Seek scraper pattern.
+    """Automation entrypoint for Voyages scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
     """
     try:
+        # Run scraping
         scraper = VoyagesScraper(max_jobs=max_jobs, headless=True)
         jobs_scraped = scraper.scrape_jobs()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'jobs_scraped': jobs_scraped,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'jobs_scraped': jobs_scraped,
-            'message': f'Successfully scraped {jobs_scraped} Voyages jobs'
+            'message': f'Successfully scraped and processed {jobs_scraped} Voyages jobs'
         }
     except SystemExit as e:
         return {
@@ -2006,7 +2420,7 @@ def run(max_jobs=None):
         }
     except Exception as e:
         try:
-            logger.error(f"Scraping failed in run(): {e}")
+            logging.getLogger(__name__).error(f"Scraping failed in run(): {e}")
         except Exception:
             pass
         return {

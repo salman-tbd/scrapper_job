@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
-Professional Robert Half Australia Job Scraper using Playwright
-===============================================================
+Professional Robert Half Australia Job Scraper using Playwright with ETL Pipeline
+=================================================================================
 
 Advanced Playwright-based scraper for Robert Half Australia (https://www.roberthalf.com/au/en/jobs/all/all) 
-that integrates with your existing job scraper project database structure:
+that integrates with your existing seek_scraper_project ETL pipeline:
 
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
 - Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
 - Professional database structure (JobPosting, Company, Location)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
 - Enhanced duplicate detection
 - Comprehensive error handling and logging
 - Supports recruitment agency job listings
+- ETL-ready data saved to StagingJob table
 
 Features:
 - 🎯 Smart job data extraction from Robert Half Australia
@@ -20,13 +30,28 @@ Features:
 - 🛡️ Duplicate detection and data validation
 - 📈 Detailed scraping statistics and summaries
 - 🔄 Professional recruitment job categorization
+- 🔄 ETL pipeline integration for professional data flow
 
 Usage:
-    python roberthalf_australia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python roberthalf_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python roberthalf_australia_scraper.py 30 --auto-etl        # Scrape 30 + auto ETL
     
+    # Two-step manual process
+    python roberthalf_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=roberthalf.com.au  # Then run ETL
+    
+    # Other options
+    python roberthalf_australia_scraper.py 100 --reset          # Clear staging first
+    python roberthalf_australia_scraper.py                      # Scrape all jobs
+
 Examples:
-    python roberthalf_australia_scraper.py 30    # Scrape 30 jobs
-    python roberthalf_australia_scraper.py       # Scrape all available jobs (default: 50)
+    python roberthalf_australia_scraper.py 30 --auto-etl     # Scrape 30 jobs + ETL
+    python roberthalf_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python roberthalf_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -58,6 +83,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -1011,77 +1037,111 @@ class RobertHalfAustraliaScraper:
             return 'other'
 
     def save_job(self, job_data, page):
-        """Save job to database with proper error handling"""
+        """Save job to StagingJob for ETL processing"""
         try:
-            with transaction.atomic():
-                # Check for duplicates
-                existing_job = JobPosting.objects.filter(external_url=job_data['url']).first()
-                if existing_job:
-                    logger.info(f"Duplicate job found: {job_data['title']}")
-                    self.stats['duplicate_jobs'] += 1
-                    return False
+            # Validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('url', '')
+            
+            if not job_title or not job_url:
+                logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.stats['errors'] += 1
+                return False
+            
+            # Get detailed job information
+            job_details = self.get_job_details(job_url, page)
+            
+            # Categorize job
+            full_description_text = job_details.get('description_text', '')
+            category = self.categorize_job(job_title, full_description_text)
+            
+            # Extract skills data
+            required_skills = job_details.get('skills', [])
+            preferred_skills = job_details.get('preferred_skills', [])
+            
+            # Convert skills lists to comma-separated strings (limited to 200 chars each)
+            skills_str = ', '.join(required_skills)[:200] if required_skills else ''
+            preferred_skills_str = ', '.join(preferred_skills)[:200] if preferred_skills else ''
+            
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'permanent': 'Permanent',
+                'casual': 'Casual'
+            }
+            job_type = job_type_map.get(job_data.get('job_type', 'full_time'), 'Full-time')
+            
+            # Use job_id as external_id (unique identifier)
+            external_id = job_data.get('job_id', '') or job_url.split('/')[-1]
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_details.get('description', ''),
+                'company_name': job_details.get('company', 'Robert Half'),
+                'location': job_data.get('location', 'Australia'),
+                'salary': job_data.get('salary_raw_text', ''),
+                'job_type': job_type,
+                'category': category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                # Get detailed job information
-                job_details = self.get_job_details(job_data['url'], page)
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': job_data.get('work_mode', 'on_site'),
+                'skills': skills_str,
+                'preferred_skills': preferred_skills_str,
+                'closing_date': '',
+                'posted_date': job_data.get('date_posted', ''),
+                'experience_level': job_details.get('experience_level', 'mid_level'),
                 
-                # Get or create company
-                company = self.get_or_create_company(job_details['company'])
-                
-                # Get or create location
-                location = self.get_or_create_location(job_data['location'])
-                
-                # Categorize job
-                full_description_text = job_details.get('description_text', '')
-                category = self.categorize_job(job_data['title'], full_description_text)
-                
-                # Extract skills data
-                required_skills = job_details.get('skills', [])
-                preferred_skills = job_details.get('preferred_skills', [])
-                
-                # Convert skills lists to comma-separated strings (limited to 200 chars each)
-                skills_str = ', '.join(required_skills)[:200] if required_skills else ''
-                preferred_skills_str = ', '.join(preferred_skills)[:200] if preferred_skills else ''
-                
-                # Create job posting with HTML description and skills
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'][:200],  # Keep title limit for database constraint
-                    description=job_details['description'],  # HTML formatted description
-                    company=company,
-                    location=location,
-                    posted_by=self.default_user,
-                    job_category=category,
-                    job_type=job_data.get('job_type', 'full_time'),
-                    experience_level=job_details.get('experience_level', '')[:100],  # Keep reasonable limit
-                    work_mode=job_data.get('work_mode', '')[:50],  # Keep reasonable limit
-                    salary_min=job_data.get('salary_min'),
-                    salary_max=job_data.get('salary_max'),
-                    salary_type=job_data.get('salary_type', 'yearly'),
-                    salary_currency='AUD',
-                    salary_raw_text=job_data.get('salary_raw_text', '')[:200],  # Keep for display purposes
-                    external_source='roberthalf.com.au',
-                    external_url=job_data['url'],  # No length restriction on URL
-                    posted_ago=job_data.get('posted_ago', '')[:50],  # Keep reasonable limit
-                    status='active',
-                    skills=skills_str,  # Required skills (comma-separated)
-                    preferred_skills=preferred_skills_str,  # Preferred skills (comma-separated)
-                    additional_info={
-                        'scrape_timestamp': datetime.now().isoformat(),
-                        'source_page': 'Robert Half Australia',
-                        'recruitment_agency': True,
-                        'job_id': job_data.get('job_id', ''),
-                        'original_copy': job_data.get('description', ''),  # Store original short description too
-                        'description_text': job_details.get('description_text', ''),  # Store text version for reference
-                        'extracted_skills_count': len(required_skills),
-                        'extracted_preferred_skills_count': len(preferred_skills)
-                    }
-                )
-                
-                logger.info(f"Saved job: {job_data['title']} at {company.name}")
-                self.stats['new_jobs'] += 1
-                return True
+                # Store all raw data for ETL processing
+                'raw_roberthalf_data': {
+                    'salary_min': str(job_data.get('salary_min', '')),
+                    'salary_max': str(job_data.get('salary_max', '')),
+                    'salary_currency': 'AUD',
+                    'salary_type': job_data.get('salary_type', 'yearly'),
+                    'job_id': job_data.get('job_id', ''),
+                    'description_text': job_details.get('description_text', ''),
+                    'extracted_skills_count': len(required_skills),
+                    'extracted_preferred_skills_count': len(preferred_skills),
+                    'recruitment_agency': True,
+                    'scraper_version': 'RobertHalf-Australia-1.0-ETL',
+                    'country': 'Australia'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='roberthalf.com.au',
+                job_url=job_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                self.stats['errors'] += 1
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.stats['duplicate_jobs'] += 1
+                return False
+            
+            # Success - log details
+            self.stats['new_jobs'] += 1
+            location_str = f" - {staging_data['location']}" if staging_data['location'] else ""
+            logger.info(f"[SUCCESS] Saved to staging: {job_title} at {staging_data['company_name']}{location_str}")
+            logger.info(f"  🔧 Skills ({len(required_skills)}): {skills_str}")
+            logger.info(f"  ⭐ Preferred Skills ({len(preferred_skills)}): {preferred_skills_str}")
+            return True
                 
         except Exception as e:
-            logger.error(f"Error saving job {job_data.get('title', 'Unknown')}: {e}")
+            logger.error(f"Error saving job to staging: {e}")
+            logger.exception(e)
             self.stats['errors'] += 1
             return False
 
@@ -1266,48 +1326,307 @@ class RobertHalfAustraliaScraper:
         logger.info("=" * 60)
 
 
+def reset_database():
+    """Reset/clear all Robert Half jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='roberthalf.com.au').count()
+            StagingJob.objects.filter(external_source='roberthalf.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} Robert Half jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Robert Half jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.stats['new_jobs'],  # Jobs saved to staging
+                    'duplicates_found': scraper.stats['duplicate_jobs'],  # Scraper duplicates
+                    'errors': scraper.stats['errors']
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='roberthalf.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending Robert Half jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='roberthalf.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} Robert Half jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='roberthalf.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='roberthalf.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'roberthalf.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.stats['new_jobs'],
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.stats['duplicate_jobs']
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.stats['new_jobs'],
+            total_processed=0,
+            total_duplicates=scraper.stats['duplicate_jobs'],
+            total_errors=scraper.stats['errors'],
+            new_skills_added=0,
+            status='success' if scraper.stats['errors'] == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.stats['new_jobs']}")
+        print(f"   Duplicates: {scraper.stats['duplicate_jobs']}")
+        print(f"   Errors: {scraper.stats['errors']}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
-    """Main function with pagination support"""
-    max_jobs = None  # Default unlimited
-    max_pages = None  # Default: auto-calculate based on max_jobs
+    """Main function."""
+    import argparse
     
     # Parse command line arguments
-    # Usage: python script.py [max_jobs] [max_pages]
-    # Examples:
-    #   python script.py 50        - Scrape max 50 jobs (auto-calculate pages)
-    #   python script.py 50 3      - Scrape max 50 jobs from first 3 pages  
-    #   python script.py - 2       - Scrape all jobs from first 2 pages
+    parser = argparse.ArgumentParser(description='Robert Half Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Robert Half jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    if len(sys.argv) > 1:
-        try:
-            if sys.argv[1] != '-':
-                max_jobs = int(sys.argv[1])
-                logger.info(f"Job limit set to: {max_jobs}")
-        except ValueError:
-            logger.error("Invalid job limit. Please provide a number or '-'.")
-            sys.exit(1)
+    args = parser.parse_args()
     
-    if len(sys.argv) > 2:
-        try:
-            max_pages = int(sys.argv[2])
-            logger.info(f"Page limit set to: {max_pages}")
-        except ValueError:
-            logger.error("Invalid page limit. Please provide a number.")
-            sys.exit(1)
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Robert Half jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
     
-    # Create and run scraper
-    scraper = RobertHalfAustraliaScraper(max_jobs=max_jobs, headless=True, max_pages=max_pages)
-    scraper.scrape_jobs()
+    # Set job limit
+    job_limit = args.job_limit
+    if job_limit:
+        logger.info(f"Job limit set to: {job_limit}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    # Initialize and run scraper
+    try:
+        scraper = RobertHalfAustraliaScraper(max_jobs=job_limit, headless=True)
+        scraper.scrape_jobs()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 def run(max_jobs=None, max_pages=None):
-    """Automation entrypoint for Robert Half Australia scraper."""
+    """Automation entrypoint for Robert Half Australia scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
+    """
     try:
+        # Run scraping
         scraper = RobertHalfAustraliaScraper(max_jobs=max_jobs, headless=True, max_pages=max_pages)
         scraper.scrape_jobs()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logger.error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'stats': scraper.stats,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
-            'message': 'Robert Half scraping completed'
+            'stats': scraper.stats,
+            'message': 'Robert Half scraping and ETL completed'
         }
     except SystemExit as e:
         return {

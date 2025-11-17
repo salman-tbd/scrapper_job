@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
 """
-Professional Pro Bono Australia Job Scraper using Playwright
-=============================================================
+Professional Pro Bono Australia Job Scraper using Playwright with ETL Pipeline
+===============================================================================
 
 Advanced Playwright-based scraper for Pro Bono Australia (https://probonoaustralia.com.au/search-jobs/) 
-that integrates with your existing job scraper project database structure:
+that integrates with your existing ETL pipeline:
 
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Features:
+- ETL pipeline integration for professional data flow
 - Uses Playwright for modern, reliable web scraping
-- Professional database structure (JobPosting, Company, Location)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
 - Enhanced duplicate detection
 - Comprehensive error handling and logging
 - Social sector and non-profit industry optimization
 
-Features:
-- 🎯 Smart job data extraction from Pro Bono Australia
-- 📊 Real-time progress tracking with job count
-- 🛡️ Duplicate detection and data validation
-- 📈 Detailed scraping statistics and summaries
-- 🔄 Professional non-profit job categorization
-
 Usage:
-    python probonoaustralia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python probonoaustralia_scraper.py 20 --auto-etl     # Scrape 20 + auto ETL
+    python probonoaustralia_scraper.py --auto-etl        # Scrape all + auto ETL
     
+    # Two-step manual process
+    python probonoaustralia_scraper.py 30                # Scrape only
+    python manage.py run_etl_pipeline --source=probonoaustralia.com.au  # Then run ETL
+    
+    # Other options
+    python probonoaustralia_scraper.py 100 --reset       # Clear staging first
+
 Examples:
-    python probonoaustralia_scraper.py 20    # Scrape 20 jobs
-    python probonoaustralia_scraper.py       # Scrape all available jobs
+    python probonoaustralia_scraper.py 20 --auto-etl    # Scrape 20 jobs + ETL
+    python probonoaustralia_scraper.py --auto-etl       # Scrape ALL jobs + ETL
 """
 
 import os
@@ -64,6 +74,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -1030,16 +1041,9 @@ class ProBonoAustraliaScraper:
             return 'other'
 
     def save_job(self, job_data, page):
-        """Save job to database with proper error handling"""
+        """Save job to StagingJob for ETL processing"""
         try:
             with transaction.atomic():
-                # Check for duplicates
-                existing_job = JobPosting.objects.filter(external_url=job_data['url']).first()
-                if existing_job:
-                    logger.info(f"Duplicate job found: {job_data['title']}")
-                    self.stats['duplicate_jobs'] += 1
-                    return False
-                
                 # Get detailed job information from the individual job page
                 job_details = self.get_job_details(job_data['url'], page)
                 
@@ -1058,50 +1062,85 @@ class ProBonoAustraliaScraper:
                 logger.info(f"  -> Skills ({len(skills)} chars): {skills}")
                 logger.info(f"  -> Preferred Skills ({len(preferred_skills)} chars): {preferred_skills}")
                 
-                # Get or create company using details from job page
-                company = self.get_or_create_company(
-                    job_details['company'], 
-                    logo_url=job_details.get('company_logo')
-                )
-                
-                # Get or create location using details from job page
-                location = self.get_or_create_location(job_details['location'])
-                
                 # Categorize job
                 category = self.categorize_job(job_data['title'], description_for_skills, job_details['company'])
                 
-                # Create job posting with skills
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'][:200],  # Truncate title to fit CharField limit
-                    description=job_details['description'],  # HTML formatted description
-                    company=company,
-                    location=location,
-                    posted_by=self.default_user,
-                    job_category=category,
-                    job_type=job_details['job_type'],
-                    salary_min=job_details['salary_min'],
-                    salary_max=job_details['salary_max'],
-                    salary_type=job_details['salary_type'],
-                    salary_raw_text=job_details['salary_raw_text'][:200] if job_details['salary_raw_text'] else '',
-                    external_source='probonoaustralia.com.au',
-                    external_url=job_data['url'][:500],  # Truncate URL if too long
-                    posted_ago=job_data.get('posted_ago', '')[:50],  # Truncate posted_ago
-                    status='active',
-                    job_closing_date=job_details.get('job_closing_date', '')[:100] if job_details.get('job_closing_date') else '',  # Store raw closing date text
-                    skills=skills,  # Required skills extracted from job description
-                    preferred_skills=preferred_skills,  # Preferred skills extracted from job description
-                    additional_info={
-                        'is_featured': job_data.get('is_featured', False),
-                        'closing_date': job_details['closing_date'].isoformat() if job_details['closing_date'] else None,
+                # Prepare external_id from URL
+                external_url = job_data['url'][:500]
+                external_id = external_url.split('/')[-2] if external_url.endswith('/') else external_url.split('/')[-1]
+                
+                # Truncate external_id to 100 characters to fit database field
+                if len(external_id) > 100:
+                    external_id = external_id[:100]
+                
+                # Map job_type to standard format
+                job_type_map = {
+                    'full_time': 'Full-time',
+                    'part_time': 'Part-time',
+                    'contract': 'Contract',
+                    'temporary': 'Temporary',
+                    'casual': 'Casual',
+                    'internship': 'Internship',
+                    'freelance': 'Freelance'
+                }
+                job_type = job_type_map.get(job_details.get('job_type', 'full_time'), 'Full-time')
+                
+                # Convert date to string for JSON serialization
+                posted_date_str = ''
+                closing_date_str = job_details.get('job_closing_date', '')
+                
+                # Prepare staging data
+                staging_data = {
+                    'title': job_data['title'][:200],
+                    'description': job_details['description'],  # HTML formatted description
+                    'company_name': job_details['company'],
+                    'location': job_details['location'],
+                    'salary': job_details['salary_raw_text'][:200] if job_details['salary_raw_text'] else '',
+                    'job_type': job_type,
+                    'category': category,
+                    'posted_ago': job_data.get('posted_ago', '')[:50],
+                    
+                    # Additional fields
+                    'employment_type': job_type,
+                    'work_mode': 'on_site',
+                    'skills': skills,
+                    'preferred_skills': preferred_skills,
+                    'closing_date': closing_date_str,
+                    'posted_date': posted_date_str,
+                    'experience_level': 'mid_level',
+                    
+                    # Store all raw data for ETL processing
+                    'raw_probono_data': {
+                        'salary_min': str(job_details['salary_min']) if job_details['salary_min'] else '',
+                        'salary_max': str(job_details['salary_max']) if job_details['salary_max'] else '',
+                        'salary_type': job_details['salary_type'],
                         'profession': job_details['profession'],
                         'sector': job_details['sector'],
-                        'company_logo': job_details.get('company_logo', ''),  # Store company logo URL
-                        'scrape_timestamp': datetime.now().isoformat(),
-                        'skills_extracted': True,  # Flag to indicate skills were automatically extracted
-                        'total_skills_found': len(skills.split(', ')) if skills else 0,
-                        'total_preferred_skills_found': len(preferred_skills.split(', ')) if preferred_skills else 0
+                        'company_logo': job_details.get('company_logo', ''),
+                        'is_featured': job_data.get('is_featured', False),
+                        'closing_date_parsed': job_details['closing_date'].isoformat() if job_details['closing_date'] else None,
+                        'scraper_version': 'ProBonoAustralia-Playwright-1.0-ETL',
+                        'country': 'Australia'
                     }
+                }
+                
+                # Save to staging using ETL helper
+                staging_job, created = save_to_staging(
+                    source='probonoaustralia.com.au',
+                    job_url=external_url,
+                    job_data=staging_data,
+                    external_id=external_id
                 )
+                
+                if not staging_job:
+                    logger.error(f"Failed to save to staging: {job_data['title']}")
+                    self.stats['errors'] += 1
+                    return False
+                
+                if not created:
+                    logger.info(f"[DUPLICATE] Skipped duplicate job: {job_data['title']}")
+                    self.stats['duplicate_jobs'] += 1
+                    return False
                 
                 # Update skills statistics
                 if skills:
@@ -1111,7 +1150,7 @@ class ProBonoAustraliaScraper:
                     self.stats['jobs_with_preferred_skills'] += 1
                     self.stats['total_preferred_skills_extracted'] += len(preferred_skills.split(', '))
                 
-                logger.info(f"Saved job: {job_data['title']} at {company.name} with {len(skills.split(', ')) if skills else 0} skills and {len(preferred_skills.split(', ')) if preferred_skills else 0} preferred skills")
+                logger.info(f"[SUCCESS] Saved to staging: {job_data['title']} at {job_details['company']} with {len(skills.split(', ')) if skills else 0} skills and {len(preferred_skills.split(', ')) if preferred_skills else 0} preferred skills")
                 self.stats['new_jobs'] += 1
                 return True
                 
@@ -1342,38 +1381,285 @@ class ProBonoAustraliaScraper:
         logger.info("=" * 60)
 
 
+def reset_database():
+    """Reset/clear all Pro Bono Australia jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='probonoaustralia.com.au').count()
+            StagingJob.objects.filter(external_source='probonoaustralia.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} Pro Bono Australia jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Pro Bono Australia jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.stats['new_jobs'],  # Jobs saved to staging
+                    'duplicates_found': scraper.stats['duplicate_jobs'],  # Scraper duplicates
+                    'errors': scraper.stats['errors']
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='probonoaustralia.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending Pro Bono Australia jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='probonoaustralia.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} Pro Bono Australia jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='probonoaustralia.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='probonoaustralia.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'probonoaustralia.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.stats['new_jobs'],
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.stats['duplicate_jobs']
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.stats['new_jobs'],
+            total_processed=0,
+            total_duplicates=scraper.stats['duplicate_jobs'],
+            total_errors=scraper.stats['errors'],
+            new_skills_added=0,
+            status='success' if scraper.stats['errors'] == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.stats['new_jobs']}")
+        print(f"   Duplicates: {scraper.stats['duplicate_jobs']}")
+        print(f"   Errors: {scraper.stats['errors']}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function"""
-    max_jobs = None
-    max_pages = None
+    import argparse
     
     # Parse command line arguments
-    # Usage: python script.py [max_jobs] [max_pages]
-    # Examples:
-    #   python script.py 20        - Scrape max 20 jobs from all pages
-    #   python script.py 20 3      - Scrape max 20 jobs from first 3 pages
-    #   python script.py - 2       - Scrape all jobs from first 2 pages
+    parser = argparse.ArgumentParser(description='Pro Bono Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--max-pages', type=int, default=None,
+                       help='Maximum number of pages to scrape')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Pro Bono Australia jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    if len(sys.argv) > 1:
-        try:
-            if sys.argv[1] != '-':
-                max_jobs = int(sys.argv[1])
-                logger.info(f"Job limit set to: {max_jobs}")
-        except ValueError:
-            logger.error("Invalid job limit. Please provide a number or '-'.")
-            sys.exit(1)
+    args = parser.parse_args()
     
-    if len(sys.argv) > 2:
-        try:
-            max_pages = int(sys.argv[2])
-            logger.info(f"Page limit set to: {max_pages}")
-        except ValueError:
-            logger.error("Invalid page limit. Please provide a number.")
-            sys.exit(1)
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Pro Bono Australia jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job and page limits
+    max_jobs = args.job_limit
+    max_pages = args.max_pages
+    
+    if max_jobs:
+        logger.info(f"Job limit set to: {max_jobs}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    if max_pages:
+        logger.info(f"Page limit set to: {max_pages}")
     
     # Create and run scraper
-    scraper = ProBonoAustraliaScraper(max_jobs=max_jobs, headless=True, max_pages=max_pages)
-    scraper.scrape_jobs()
+    try:
+        scraper = ProBonoAustraliaScraper(max_jobs=max_jobs, headless=True, max_pages=max_pages)
+        scraper.scrape_jobs()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
@@ -1381,14 +1667,27 @@ if __name__ == "__main__":
 
 
 def run(max_jobs=None, max_pages=None):
-    """Automation entrypoint for Pro Bono Australia scraper."""
+    """Automation entrypoint for Pro Bono Australia scraper with auto-ETL."""
     try:
         scraper = ProBonoAustraliaScraper(max_jobs=max_jobs, headless=True, max_pages=max_pages)
         scraper.scrape_jobs()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'stats': getattr(scraper, 'stats', {}),
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'stats': getattr(scraper, 'stats', {}),
-            'message': 'Pro Bono Australia scraping completed'
+            'message': 'Pro Bono Australia scraping and ETL completed'
         }
     except Exception as e:
         try:

@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Professional HealthTimes Australia Healthcare Jobs Scraper
-==========================================================
+Professional HealthTimes Australia Healthcare Jobs Scraper with ETL Pipeline
+============================================================================
 
 Advanced Playwright-based scraper for HealthTimes Australia (https://healthtimes.com.au/job-search/) 
-that integrates with the existing australia_job_scraper database structure.
+that integrates with your existing seek_scraper_project ETL pipeline:
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
 
 HealthTimes specializes in healthcare jobs across Australia including:
 - Nursing positions (RN, EN, midwives)
@@ -15,6 +22,7 @@ HealthTimes specializes in healthcare jobs across Australia including:
 
 Features:
 - Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
 - Professional database structure (JobPosting, Company, Location)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
@@ -22,13 +30,28 @@ Features:
 - Comprehensive error handling and logging
 - Australian healthcare job optimization
 - Pagination support for complete data extraction
+- ETL-ready data saved to StagingJob table
 
 Usage:
-    python healthtimes_australia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python healthtimes_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python healthtimes_australia_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python healthtimes_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=healthtimes.com.au  # Then run ETL
+    
+    # Other options
+    python healthtimes_australia_scraper.py 100 --reset          # Clear staging first
+    python healthtimes_australia_scraper.py                      # Scrape all jobs
     
 Examples:
-    python healthtimes_australia_scraper.py 50    # Scrape 50 healthcare jobs
-    python healthtimes_australia_scraper.py       # Scrape all available jobs
+    python healthtimes_australia_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python healthtimes_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python healthtimes_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -70,6 +93,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -963,166 +987,159 @@ class HealthTimesAustraliaJobScraper:
         self.print_scraping_summary()
 
     def save_jobs_to_database(self, jobs: List[ScrapedJob]):
-        """Save scraped jobs to the database."""
-        self.logger.info(f"Saving {len(jobs)} jobs to database...")
+        """Save scraped jobs to StagingJob for ETL processing."""
+        self.logger.info(f"Saving {len(jobs)} jobs to staging database for ETL processing...")
         
         for job in jobs:
             try:
-                with transaction.atomic():
-                    # Get or create company
-                    company, created = Company.objects.get_or_create(
-                        name=job.company_name,
-                        defaults={
-                            'description': f'Healthcare company from HealthTimes',
-                            'website': 'https://healthtimes.com.au'
-                        }
-                    )
-                    
-                    # Get or create location with proper mapping
-                    location_city = job.location_text
-                    location_state = 'Australia'
-                    
-                    # Map location abbreviations to full names and states
-                    location_mapping = {
-                        'NSW': {'city': 'New South Wales', 'state': 'NSW'},
-                        'VIC': {'city': 'Victoria', 'state': 'VIC'},
-                        'QLD': {'city': 'Queensland', 'state': 'QLD'},
-                        'SA': {'city': 'South Australia', 'state': 'SA'},
-                        'WA': {'city': 'Western Australia', 'state': 'WA'},
-                        'TAS': {'city': 'Tasmania', 'state': 'TAS'},
-                        'NT': {'city': 'Northern Territory', 'state': 'NT'},
-                        'ACT': {'city': 'Australian Capital Territory', 'state': 'ACT'},
-                        'Sydney': {'city': 'Sydney', 'state': 'NSW'},
-                        'Melbourne': {'city': 'Melbourne', 'state': 'VIC'},
-                        'Brisbane': {'city': 'Brisbane', 'state': 'QLD'},
-                        'Perth': {'city': 'Perth', 'state': 'WA'},
-                        'Adelaide': {'city': 'Adelaide', 'state': 'SA'},
-                        'Hobart': {'city': 'Hobart', 'state': 'TAS'},
-                        'Darwin': {'city': 'Darwin', 'state': 'NT'},
-                        'Canberra': {'city': 'Canberra', 'state': 'ACT'}
-                    }
-                    
-                    if job.location_text in location_mapping:
-                        location_city = location_mapping[job.location_text]['city']
-                        location_state = location_mapping[job.location_text]['state']
-                        self.logger.info(f"Location mapping: '{job.location_text}' -> '{location_city}, {location_state}'")
-                    
-                    # Create location name for display
-                    location_name = f"{location_city}, {location_state}" if location_state != 'Australia' else location_city
-                    
-                    location, created = Location.objects.get_or_create(
-                        name=location_name,
-                        defaults={
-                            'city': location_city,
-                            'state': location_state,
-                            'country': 'Australia'
-                        }
-                    )
-                    
-                    if created:
-                        self.logger.info(f"Created new location: {location_name} (city={location_city}, state={location_state})")
+                # Validation
+                if not job.title or not job.job_url:
+                    self.logger.warning(f"Missing required fields (title or URL) for job: {job.title}")
+                    self.errors_count += 1
+                    continue
+                
+                # Parse salary with correct type detection
+                salary_min, salary_max, salary_type = self.parse_salary(job.salary_text)
+                
+                # Parse job type to match model choices with enhanced mapping
+                job_type_mapping = {
+                    'Full Time': 'Full-time',
+                    'Part Time': 'Part-time', 
+                    'Casual': 'Casual',
+                    'Contract': 'Contract',
+                    'Temporary': 'Temporary',
+                    'Permanent': 'Permanent',
+                    'Healthcare': 'Full-time',  # Default for healthcare
+                    'Nursing': 'Full-time',
+                    'Allied Health': 'Full-time',
+                    'Medical': 'Full-time',
+                    'Administration': 'Full-time',
+                    'Support': 'Part-time',
+                    # Handle combinations from table extraction
+                    'Temporary/Part-Time': 'Part-time',
+                    'Temporary/Full-Time': 'Full-time',
+                    'Permanent/Part-Time': 'Part-time', 
+                    'Permanent/Full-Time': 'Full-time'
+                }
+                job_type_value = job_type_mapping.get(job.job_type, 'Full-time')
+                
+                self.logger.info(f"Job type mapping: '{job.job_type}' -> '{job_type_value}'")
+                
+                # Ensure both skills fields are populated
+                skills_csv = getattr(job, 'skills_csv', '') or ''
+                preferred_csv = getattr(job, 'preferred_csv', '') or ''
+                if not skills_csv and not preferred_csv:
+                    gen_s, gen_p = self.extract_skills_from_text((job.description or '') + ' ' + (job.title or ''))
+                    skills_csv, preferred_csv = gen_s, gen_p
+                if skills_csv and not preferred_csv:
+                    preferred_csv = skills_csv
+                if preferred_csv and not skills_csv:
+                    skills_csv = preferred_csv
+                # Enforce DB max length (200 each)
+                skills_csv = (skills_csv or '')[:200]
+                preferred_csv = (preferred_csv or '')[:200]
+                
+                # Parse posted date
+                date_posted = self.parse_posted_date(job.posted_ago)
+                posted_date_str = ''
+                if date_posted:
+                    if hasattr(date_posted, 'isoformat'):
+                        posted_date_str = date_posted.isoformat()
                     else:
-                        self.logger.info(f"Using existing location: {location_name}")
+                        posted_date_str = str(date_posted)
+                
+                closing_date_str = getattr(job, 'closing_date', '')
+                
+                # Categorize job
+                job_category = JobCategorizationService.categorize_job(
+                    job.title, 
+                    job.description or ''
+                )
+                
+                # Generate tags
+                tags_list = JobCategorizationService.get_job_keywords(
+                    job.title, 
+                    job.description or ''
+                )
+                # Add healthcare-specific tags
+                healthcare_tags = ['healthcare', 'medical', 'nursing']
+                if job.experience_level:
+                    healthcare_tags.append(job.experience_level.lower())
+                tags_list.extend(healthcare_tags)
+                
+                # Handle external URL
+                external_url = job.job_url.strip() if job.job_url else ""
+                if not external_url:
+                    timestamp = int(datetime.now().timestamp())
+                    external_url = f"https://healthtimes.com.au/job/{slugify(job.title)}-{timestamp}/"
+                
+                # Use external_url as external_id (unique identifier)
+                external_id = external_url.split('/')[-2] if external_url.endswith('/') else external_url.split('/')[-1]
+                
+                # Prepare staging data
+                staging_data = {
+                    'title': job.title,
+                    'description': self.sanitize_description_html(job.description) if job.description else "",
+                    'company_name': job.company_name,
+                    'location': job.location_text,
+                    'salary': job.salary_text or '',
+                    'job_type': job_type_value,
+                    'category': job_category or 'healthcare',
+                    'posted_ago': job.posted_ago or '',
                     
-                    self.logger.info(f"Final job location will be: {job.location_text} -> Location ID: {location.id} ({location.name})")
+                    # Additional fields
+                    'employment_type': job_type_value,
+                    'work_mode': 'on_site',
+                    'skills': skills_csv,
+                    'preferred_skills': preferred_csv,
+                    'closing_date': closing_date_str,
+                    'posted_date': posted_date_str,
+                    'experience_level': job.experience_level[:100] if job.experience_level else 'mid_level',
                     
-                    # Check for duplicate jobs
-                    existing_job = JobPosting.objects.filter(
-                        title=job.title,
-                        company=company,
-                        location=location
-                    ).first()
-                    
-                    if existing_job:
-                        self.duplicates_found += 1
-                        self.logger.info(f"Duplicate job found: {job.title} at {job.company_name}")
-                        continue
-                    
-                    # Parse salary with correct type detection
-                    salary_min, salary_max, salary_type = self.parse_salary(job.salary_text)
-                    
-                    # Parse job type to match model choices with enhanced mapping
-                    job_type_mapping = {
-                        'Full Time': 'full_time',
-                        'Part Time': 'part_time', 
-                        'Casual': 'casual',
-                        'Contract': 'contract',
-                        'Temporary': 'temporary',
-                        'Permanent': 'permanent',
-                        'Healthcare': 'full_time',  # Default for healthcare
-                        'Nursing': 'full_time',
-                        'Allied Health': 'full_time',
-                        'Medical': 'full_time',
-                        'Administration': 'full_time',
-                        'Support': 'part_time',
-                        # Handle combinations from table extraction
-                        'Temporary/Part-Time': 'part_time',
-                        'Temporary/Full-Time': 'full_time',
-                        'Permanent/Part-Time': 'part_time', 
-                        'Permanent/Full-Time': 'full_time'
+                    # Store all raw data for ETL processing
+                    'raw_healthtimes_data': {
+                        'salary_min': str(salary_min) if salary_min else '',
+                        'salary_max': str(salary_max) if salary_max else '',
+                        'salary_currency': 'AUD',
+                        'salary_type': salary_type,
+                        'requirements': job.requirements or '',
+                        'benefits': job.benefits or '',
+                        'tags': ','.join(list(set(tags_list))[:15]),
+                        'scraper_version': 'HealthTimes-Playwright-Australia-1.0-ETL',
+                        'country': 'Australia'
                     }
-                    job_type_value = job_type_mapping.get(job.job_type, 'full_time')
-                    
-                    self.logger.info(f"Job type mapping: '{job.job_type}' -> '{job_type_value}'")
-                    
-                    # Ensure both skills fields are populated
-                    skills_csv = getattr(job, 'skills_csv', '') or ''
-                    preferred_csv = getattr(job, 'preferred_csv', '') or ''
-                    if not skills_csv and not preferred_csv:
-                        gen_s, gen_p = self.extract_skills_from_text((job.description or '') + ' ' + (job.title or ''))
-                        skills_csv, preferred_csv = gen_s, gen_p
-                    if skills_csv and not preferred_csv:
-                        preferred_csv = skills_csv
-                    if preferred_csv and not skills_csv:
-                        skills_csv = preferred_csv
-                    # Enforce DB max length (200 each)
-                    skills_csv = (skills_csv or '')[:200]
-                    preferred_csv = (preferred_csv or '')[:200]
-
-                    # Create job posting with correct field names
-                    job_posting = JobPosting.objects.create(
-                        title=job.title,
-                        company=company,
-                        location=location,
-                        posted_by=self.bot_user,
-                        job_type=job_type_value,
-                        job_category='healthcare',
-                        # Prefer cleaned HTML if we produced any, else use plain text wrapped
-                        description=(
-                            self.sanitize_description_html(job.description) if job.description else ""
-                        )[:5000] or "<p>Healthcare position</p>",
-                        salary_min=salary_min,
-                        salary_max=salary_max,
-                        salary_currency='AUD',
-                        salary_type=salary_type,
-                        salary_raw_text=job.salary_text[:200] if job.salary_text else "",
-                        experience_level=job.experience_level[:100] if job.experience_level else "",
-                        date_posted=self.parse_posted_date(job.posted_ago),
-                        external_url=job.job_url,
-                        external_source='HealthTimes',
-                        posted_ago=job.posted_ago[:50] if job.posted_ago else "",
-                        status='active',
-                        job_closing_date=getattr(job, 'closing_date', ''),
-                        skills=skills_csv,
-                        preferred_skills=preferred_csv,
-                        additional_info={
-                            'requirements': job.requirements,
-                            'benefits': job.benefits,
-                            'scraped_from': 'healthtimes.com.au'
-                        }
-                    )
-                    
-                    # Auto-categorize the job
-                    try:
-                        JobCategorizationService.categorize_job(job_posting)
-                    except Exception as e:
-                        self.logger.warning(f"Could not categorize job {job_posting.id}: {e}")
-                    
-                    self.jobs_saved += 1
-                    self.logger.info(f"Saved job: {job.title} at {job.company_name}")
-                    
+                }
+                
+                # Save to staging using ETL helper
+                staging_job, created = save_to_staging(
+                    source='healthtimes.com.au',
+                    job_url=external_url,
+                    job_data=staging_data,
+                    external_id=external_id
+                )
+                
+                if not staging_job:
+                    self.logger.error(f"Failed to save to staging: {job.title}")
+                    self.errors_count += 1
+                    continue
+                
+                if not created:
+                    self.logger.info(f"[DUPLICATE] Skipped duplicate job: {job.title}")
+                    self.duplicates_found += 1
+                    continue
+                
+                # Success - log details
+                self.logger.info(f"[SUCCESS] Saved to staging: {job.title}")
+                self.logger.info(f"  Company: {staging_data['company_name']}")
+                self.logger.info(f"  Category: {staging_data['category']}")
+                self.logger.info(f"  Location: {staging_data['location']}")
+                self.logger.info(f"  Skills ({len(skills_csv.split(',')) if skills_csv else 0}): {skills_csv or 'Not specified'}")
+                
+                self.jobs_saved += 1
+                
             except Exception as e:
-                self.logger.error(f"Error saving job {job.title}: {e}")
+                self.logger.error(f"Error saving job to staging: {e}")
+                self.logger.exception(e)
                 self.errors_count += 1
                 continue
 
@@ -1221,7 +1238,7 @@ class HealthTimesAustraliaJobScraper:
         print("🏥 HEALTHTIMES AUSTRALIA SCRAPING SUMMARY")
         print("="*60)
         print(f"📊 Jobs Scraped: {self.jobs_scraped}")
-        print(f"💾 Jobs Saved: {self.jobs_saved}")
+        print(f"💾 Jobs Saved to Staging: {self.jobs_saved}")
         print(f"🔄 Duplicates Found: {self.duplicates_found}")
         print(f"❌ Errors Encountered: {self.errors_count}")
         if self.total_pages:
@@ -1229,39 +1246,328 @@ class HealthTimesAustraliaJobScraper:
         print(f"✅ Success Rate: {((self.jobs_saved)/(self.jobs_scraped) if self.jobs_scraped > 0 else 0)*100:.1f}%")
         print("="*60)
         
+        # Staging job statistics
+        try:
+            from apps.jobs.models import StagingJob
+            
+            total = StagingJob.objects.filter(external_source='healthtimes.com.au').count()
+            pending = StagingJob.objects.filter(external_source='healthtimes.com.au', is_processed=False).count()
+            self.logger.info(f"Total HealthTimes jobs in staging: {total}, Pending ETL: {pending}")
+            print(f"📦 Total in Staging: {total}, Pending ETL: {pending}")
+        except Exception as e:
+            self.logger.error(f"Error getting staging stats: {e}")
+        
+        print("="*60)
+        
         if self.jobs_saved > 0:
             print("✅ Scraping completed successfully!")
-            print("🔍 Check the database for new healthcare job postings.")
+            print("🔍 Jobs saved to staging - run ETL pipeline to process them.")
+            print("💡 Run: python manage.py run_etl_pipeline --source=healthtimes.com.au")
         else:
             print("⚠️  No new jobs were saved. Check logs for details.")
 
 
+def reset_database():
+    """Reset/clear all HealthTimes Jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='healthtimes.com.au').count()
+            StagingJob.objects.filter(external_source='healthtimes.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} HealthTimes jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped HealthTimes jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.jobs_saved,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicates_found,  # Scraper duplicates
+                    'errors': scraper.errors_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='healthtimes.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending HealthTimes jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='healthtimes.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} HealthTimes jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='healthtimes.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='healthtimes.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'healthtimes.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.jobs_saved,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicates_found
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.jobs_saved,
+            total_processed=0,
+            total_duplicates=scraper.duplicates_found,
+            total_errors=scraper.errors_count,
+            new_skills_added=0,
+            status='success' if scraper.errors_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.jobs_saved}")
+        print(f"   Duplicates: {scraper.duplicates_found}")
+        print(f"   Errors: {scraper.errors_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
-    """Main function to run the scraper."""
-    job_limit = None
+    """Main function."""
+    import argparse
     
     # Parse command line arguments
-    if len(sys.argv) > 1:
-        try:
-            job_limit = int(sys.argv[1])
-            print(f"🎯 Job limit set to: {job_limit}")
-        except ValueError:
-            print("❌ Invalid job limit. Please provide a number.")
+    parser = argparse.ArgumentParser(description='HealthTimes Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing HealthTimes jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
+    
+    args = parser.parse_args()
+    
+    logger = logging.getLogger(__name__)
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing HealthTimes jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
             return
     
-    # Create and run scraper
-    scraper = HealthTimesAustraliaJobScraper(job_limit=job_limit)
-    scraper.run_scraper()
-
-
-def run(job_limit=100):
-    """Automation entrypoint for HealthTimes Australia scraper."""
+    # Set job limit
+    job_limit = args.job_limit
+    if job_limit:
+        logger.info(f"🎯 Job limit set to: {job_limit}")
+    else:
+        logger.info("🎯 Job limit: unlimited")
+    
+    # Initialize and run scraper
     try:
         scraper = HealthTimesAustraliaJobScraper(job_limit=job_limit)
         scraper.run_scraper()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
+
+
+def run(job_limit=100):
+    """Automation entrypoint for HealthTimes Australia scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
+    """
+    try:
+        # Run scraping
+        scraper = HealthTimesAustraliaJobScraper(job_limit=job_limit)
+        scraper.run_scraper()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
-            'message': 'HealthTimes scraping completed'
+            'message': 'HealthTimes scraping and ETL completed'
         }
     except SystemExit as e:
         return {

@@ -1,21 +1,42 @@
 #!/usr/bin/env python
 """
-Simple Michael Page Australia Job Scraper using HTML parsing
+Simple Michael Page Australia Job Scraper using HTML parsing with ETL Pipeline
 
 This script provides a simpler alternative approach that parses the HTML content
 to extract job information without relying on complex browser automation.
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
 
 Features:
 - Direct HTML parsing approach
 - Less likely to be blocked by anti-bot measures
 - Faster execution
-- Uses the same database structure as other scrapers
+- ETL pipeline integration for professional data flow
+- Full pagination support with 'Show more Jobs' button handling
 
 Usage:
-    python michaelpage_simple_scraper.py [max_jobs]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python michaelpage_simple_scraper.py --auto-etl           # Scrape all + auto ETL
+    python michaelpage_simple_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python michaelpage_simple_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=michaelpage.com.au  # Then run ETL
+    
+    # Other options
+    python michaelpage_simple_scraper.py 100 --reset          # Clear staging first
 
 Examples:
-    python michaelpage_simple_scraper.py 20
+    python michaelpage_simple_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python michaelpage_simple_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -48,6 +69,7 @@ from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.models import JobPosting
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -274,7 +296,7 @@ class SimpleMichaelPageScraper:
                     if tag.name not in allowed_tags:
                         tag.unwrap()
                 # Remove list items that are empty or contain footer contact metadata
-                contact_phrases = ['quote job ref', 'phone number']
+                contact_phrases = ['quote job ref', 'phone number', 'contact', 'consultant']
                 for li in list(container.find_all('li')):
                     txt = (li.get_text(' ', strip=True) or '').lower()
                     if not txt:
@@ -285,6 +307,9 @@ class SimpleMichaelPageScraper:
                 for p in list(container.find_all('p')):
                     txt = (p.get_text(' ', strip=True) or '').lower()
                     if any(pht in txt for pht in contact_phrases) or re.match(r'^contact\b', txt):
+                        p.decompose()
+                    # Remove paragraphs that contain phone numbers or job references
+                    if re.search(r'(phone\s*number|job\s*ref|consultant|contact\s*name)', txt):
                         p.decompose()
                 # Remove any empty UL/OL created by the cleanup
                 for lst in list(container.find_all(['ul', 'ol'])):
@@ -411,8 +436,15 @@ class SimpleMichaelPageScraper:
                     # Skip consultant/contact metadata
                     if any(k in low for k in [
                         'consultant name', 'consultant phone', 'job reference',
-                        'function', 'specialisation', "what is your industry?", 'location', 'job type'
+                        'function', 'specialisation', "what is your industry?", 'location', 'job type',
+                        'contacthannah', "o'doherty", 'phone number'
                     ]):
+                        continue
+                    # Skip lines that start with Contact or contain phone/reference patterns
+                    if re.match(r'^contact', low) or re.search(r'(phone\s*number|job\s*ref|quote\s*job)', low):
+                        continue
+                    # Skip lines that appear to be phone numbers (digits only or mostly digits)
+                    if re.match(r'^[\d\s\(\)\-]+$', ln) and len(re.sub(r'\D', '', ln)) >= 8:
                         continue
                     # Skip bare bullets that are just Save/Apply duplicates
                     if ln in ['- Save Job', '- Apply']:
@@ -454,7 +486,10 @@ class SimpleMichaelPageScraper:
             # Cut off at known tail boilerplates if still present
             tail_cuts = [
                 'diversity & inclusion at michael page',
-                'other users applied'
+                'other users applied',
+                'contact',
+                'quote job ref',
+                'phone number'
             ]
             bt_low = best_text.lower()
             cut_index = None
@@ -463,12 +498,23 @@ class SimpleMichaelPageScraper:
                 if idx != -1:
                     cut_index = idx if cut_index is None else min(cut_index, idx)
             if cut_index is not None:
-                best_text = best_text[:cut_index]
+                best_text = best_text[:cut_index].strip()
             # If we still don't have meaningful HTML, build minimal paragraphs/ul from text
             best_html_text = best_text.strip()
             html_built = ""
             if best_html:
                 html_built = best_html
+                # Final HTML cleanup: remove any trailing contact paragraphs
+                try:
+                    soup_clean = BeautifulSoup(html_built, 'html.parser')
+                    # Remove any paragraphs containing contact info
+                    for p in soup_clean.find_all('p'):
+                        p_text = p.get_text(strip=True).lower()
+                        if any(term in p_text for term in ['contact', 'phone number', 'quote job ref', 'consultant']):
+                            p.decompose()
+                    html_built = str(soup_clean)
+                except Exception:
+                    pass
             elif best_html_text:
                 lines = [ln.strip() for ln in best_html_text.splitlines() if ln.strip()]
                 bullet_lines = [ln[2:].strip() for ln in lines if ln.startswith('- ')]
@@ -544,48 +590,99 @@ class SimpleMichaelPageScraper:
 
     def extract_skills_from_text(self, text, max_items=12):
         """Keyword fallback skill extractor from plain text only (broad).
-
         Returns tuple (skills_csv, preferred_csv).
+        Ensures minimum 4-6 items in each field.
         """
         if not text:
-            return "", ""
+            text = ""
+        
         normalized = re.sub(r"[^a-z0-9\s\+\.#/&-]", " ", text.lower())
+        
+        # Expanded skill keywords for professional services
         skill_keywords = [
+            'communication', 'stakeholder management', 'leadership', 'problem solving', 'teamwork', 'planning',
+            'budgeting', 'project management', 'agile', 'scrum', 'customer service', 'marketing', 'sales',
+            'negotiation', 'presentation skills', 'time management', 'organizational skills', 'attention to detail',
             'python', 'java', 'c#', 'c++', 'javascript', 'typescript', 'node', 'react', 'angular', 'vue',
             'django', 'flask', 'spring', 'dotnet', '.net', 'sql', 'mysql', 'postgresql', 'oracle',
             'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'linux', 'git', 'terraform',
             'excel', 'power bi', 'tableau', 'sap', 'salesforce', 'xero', 'netsuite',
-            'project management', 'agile', 'scrum', 'jira', 'confluence',
-            'communication', 'stakeholder management', 'leadership', 'problem solving',
-            'customer service', 'food hygiene', 'safety', 'environmental', 'cleaning standards'
+            'jira', 'confluence', 'sharepoint', 'microsoft word', 'database management',
+            'coordination', 'administration', 'reporting', 'data analysis', 'financial management',
+            'risk management', 'compliance', 'policy development', 'relationship building',
+            'client relationship', 'business development', 'strategic thinking', 'analytical skills'
         ]
+        
+        # Find matching skills
         found = []
         for kw in skill_keywords:
             pattern = r"\b" + re.escape(kw.replace('.', '\\.')) + r"\b"
             if re.search(pattern, normalized):
                 found.append(kw)
+        
+        # Deduplicate
         dedup = []
         seen = set()
         for kw in found:
             if kw not in seen:
                 seen.add(kw)
                 dedup.append(kw)
-        if not dedup:
-            return "", ""
-        dedup = dedup[:max_items]
-        # Split across both fields to maximize capacity
-        skills_list = []
-        preferred_list = []
-        char_limit = 200
-        # pack into skills first, then preferred
-        for item in dedup:
-            csv_try = (", ".join(skills_list + [item])).strip(', ')
-            if len(csv_try) <= char_limit:
-                skills_list.append(item)
-            else:
-                csv_try2 = (", ".join(preferred_list + [item])).strip(', ')
-                if len(csv_try2) <= char_limit:
-                    preferred_list.append(item)
+        
+        # If we don't have enough skills, add default professional skills
+        if len(dedup) < 10:
+            default_skills = [
+                'communication', 'teamwork', 'planning', 'problem solving', 'attention to detail',
+                'time management', 'organizational skills', 'relationship building', 'client relationship',
+                'project management', 'administration', 'coordination'
+            ]
+            for skill in default_skills:
+                if skill not in seen and len(dedup) < 12:
+                    dedup.append(skill)
+                    seen.add(skill)
+        
+        # Ensure we have at least 10 items total to split
+        if len(dedup) < 10:
+            # Add more generic but relevant skills
+            generic_skills = ['microsoft word', 'excel', 'customer service', 'marketing', 'sales']
+            for skill in generic_skills:
+                if skill not in seen and len(dedup) < 10:
+                    dedup.append(skill)
+                    seen.add(skill)
+        
+        # Split into skills and preferred_skills (aim for 5-6 each)
+        mid_point = len(dedup) // 2
+        if mid_point < 4:
+            mid_point = min(5, len(dedup) // 2 + 2)
+        
+        skills_list = dedup[:mid_point]
+        preferred_list = dedup[mid_point:]
+        
+        # Ensure both have at least 4 items
+        if len(skills_list) < 4:
+            # Add items to skills_list from preferred_list or defaults
+            while len(skills_list) < 4 and len(dedup) >= 4:
+                if len(skills_list) < len(dedup):
+                    skills_list = dedup[:4]
+                    preferred_list = dedup[4:]
+                break
+        
+        if len(preferred_list) < 4:
+            # If preferred is too short, duplicate some skills from skills_list
+            extra_needed = 4 - len(preferred_list)
+            for i in range(extra_needed):
+                if i < len(skills_list):
+                    preferred_list.append(skills_list[i])
+        
+        # Limit to 6 items each maximum
+        skills_list = skills_list[:6]
+        preferred_list = preferred_list[:6]
+        
+        # Final fallback - ensure both have at least 4 items
+        if len(skills_list) < 4:
+            skills_list = ['communication', 'teamwork', 'planning', 'problem solving']
+        if len(preferred_list) < 4:
+            preferred_list = ['organizational skills', 'attention to detail', 'time management', 'client relationship']
+        
         return ", ".join(skills_list), ", ".join(preferred_list)
 
     def extract_skills_from_description(self, html_description, plain_text):
@@ -595,6 +692,7 @@ class SimpleMichaelPageScraper:
         'Skills and Experience', 'Requirements', or 'Key Responsibilities'.
         Then we distribute them across `skills` and `preferred_skills` fields
         honoring each field's 200 character limit so we keep as much as possible.
+        Ensures minimum 4-6 items in each field.
         If no bullets are found, fall back to keyword extraction from plain text.
         """
         items = []
@@ -626,7 +724,7 @@ class SimpleMichaelPageScraper:
         except Exception:
             pass
 
-        # Deduplicate and pack into two CSVs within limits
+        # Deduplicate and pack into two CSVs within limits with minimum guarantees
         def pack(items_list):
             seen = set()
             unique = []
@@ -638,6 +736,7 @@ class SimpleMichaelPageScraper:
                     continue
                 seen.add(n.lower())
                 unique.append(n)
+            
             char_limit = 200
             s1, s2 = [], []
             for it in unique:
@@ -650,11 +749,28 @@ class SimpleMichaelPageScraper:
                         s2.append(it)
                     else:
                         break
+            
+            # Ensure both have at least 4 items if we had enough data
+            if len(unique) >= 8:
+                if len(s1) < 4 and len(s2) > 4:
+                    # Move some from s2 to s1
+                    while len(s1) < 4 and len(s2) > 4:
+                        s1.append(s2.pop(0))
+                elif len(s2) < 4 and len(s1) > 4:
+                    # Move some from s1 to s2
+                    while len(s2) < 4 and len(s1) > 4:
+                        s2.append(s1.pop())
+            
             return ', '.join(s1), ', '.join(s2)
 
         if items:
-            return pack(items)
-        # Fallback
+            skills, preferred = pack(items)
+            # If we still don't have enough, supplement with keyword extraction
+            if not skills or not preferred or len(skills.split(',')) < 4 or len(preferred.split(',')) < 4:
+                return self.extract_skills_from_text(plain_text or '')
+            return skills, preferred
+        
+        # Fallback to keyword extraction
         return self.extract_skills_from_text(plain_text or '')
 
     def fetch_company_details(self, target_city_hint=None):
@@ -1036,187 +1152,177 @@ class SimpleMichaelPageScraper:
         return None
     
     def save_job_to_database_sync(self, job_data):
-        """Synchronous database save function."""
+        """Save job to StagingJob for ETL processing (synchronous version)."""
         try:
             connections.close_all()
             
-            with transaction.atomic():
-                # Check for duplicates
-                job_url = job_data['job_url']
-                job_title = job_data['job_title']
-                company_name = job_data['company_name']
+            # Validation
+            job_title = job_data.get('job_title', '').strip()
+            job_url = job_data.get('job_url', '')
+            
+            if not job_title or not job_url:
+                logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.error_count += 1
+                return False
+            
+            # Parse location
+            location_name, city, state, country = self.parse_location(job_data.get('location_text', ''))
+            
+            # Parse salary
+            salary_min, salary_max, currency, salary_type, raw_text = self.parse_salary(
+                job_data.get('salary_text', '')
+            )
+            
+            # Parse date
+            date_posted = self.parse_date(job_data.get('posted_ago', ''))
+            
+            # Convert date to string for JSON serialization
+            posted_date_str = ''
+            if date_posted:
+                if hasattr(date_posted, 'isoformat'):
+                    posted_date_str = date_posted.isoformat()
+                else:
+                    posted_date_str = str(date_posted)
+            
+            # Determine job details from keywords
+            job_type = "full_time"  # Default
+            work_mode = ""
+            experience_level = ""
+            
+            keywords = job_data.get('keywords', [])
+            logger.info(f"[PROCESSING KEYWORDS] for '{job_title}': {keywords}")
+            
+            for keyword in keywords:
+                keyword_lower = keyword.lower().strip()
                 
-                if job_url and JobPosting.objects.filter(external_url=job_url).exists():
-                    logger.info(f"[DUPLICATE SKIPPED] (URL): {job_title}")
-                    self.duplicate_count += 1
-                    return False
+                # Map website job types to database job types
+                if keyword_lower == 'permanent':
+                    job_type = "permanent"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif keyword_lower == 'temporary':
+                    job_type = "temporary"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif keyword_lower == 'contract':
+                    job_type = "contract"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif 'part-time' in keyword_lower or 'part time' in keyword_lower:
+                    job_type = "part_time"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif 'casual' in keyword_lower:
+                    job_type = "casual"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif 'internship' in keyword_lower:
+                    job_type = "internship"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                elif 'freelance' in keyword_lower:
+                    job_type = "freelance"
+                    logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
+                # Work modes
+                elif 'hybrid' in keyword_lower or 'work from home' in keyword_lower or 'remote' in keyword_lower:
+                    work_mode = keyword
+                    logger.info(f"   [WORK_MODE] Set work_mode: {work_mode}")
+                # Experience levels
+                elif any(level in keyword_lower for level in ['senior', 'junior', 'graduate', 'executive', 'lead', 'manager']):
+                    experience_level = keyword
+                    logger.info(f"   [EXPERIENCE] Set experience_level: {experience_level}")
+            
+            # Automatic job categorization
+            plain_text_for_category = BeautifulSoup(job_data.get('summary_html', '') or job_data.get('summary', ''), 'html.parser').get_text(' ', strip=True)
+            job_category = JobCategorizationService.categorize_job(
+                title=job_title,
+                description=plain_text_for_category
+            )
+            
+            # Generate tags
+            tags_list = JobCategorizationService.get_job_keywords(
+                job_title,
+                plain_text_for_category
+            )
+            
+            # Extract skills/preferred skills from description
+            plain_text_for_skills = BeautifulSoup(job_data.get('summary_html', '') or job_data.get('summary', ''), 'html.parser').get_text(' ', strip=True)
+            skills_csv, preferred_csv = self.extract_skills_from_description(job_data.get('summary_html', ''), plain_text_for_skills)
+            
+            # Map job_type to standard format for staging
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'freelance': 'Freelance',
+                'permanent': 'Permanent'
+            }
+            job_type_display = job_type_map.get(job_type, 'Full-time')
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = job_url.split('/')[-2] if job_url.endswith('/') else job_url.split('/')[-1]
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_data.get('summary_html', '') or job_data.get('summary', ''),
+                'company_name': job_data.get('company_name', 'Michael Page'),
+                'location': location_name or 'Australia',
+                'salary': job_data.get('salary_text', ''),
+                'job_type': job_type_display,
+                'category': job_category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                if JobPosting.objects.filter(title=job_title, company__name=company_name).exists():
-                    logger.info(f"[DUPLICATE SKIPPED] (Title+Company): {job_title}")
-                    self.duplicate_count += 1
-                    return False
+                # Additional fields
+                'employment_type': job_type_display,
+                'work_mode': work_mode or 'on_site',
+                'skills': skills_csv,
+                'preferred_skills': preferred_csv,
+                'posted_date': posted_date_str,
+                'experience_level': experience_level or 'mid_level',
                 
-                # Create location
-                location_name, city, state, country = self.parse_location(job_data.get('location_text', ''))
-                location_obj = None
-                if location_name:
-                    location_obj, created = Location.objects.get_or_create(
-                        name=location_name,
-                        defaults={'city': city, 'state': state, 'country': country}
-                    )
-                
-                # Create company
-                company_slug = slugify(company_name)
-                company_obj, created = Company.objects.get_or_create(
-                    slug=company_slug,
-                    defaults={
-                        'name': company_name,
-                        'description': f'{company_name} - Jobs from Michael Page Australia',
-                        'website': 'https://www.michaelpage.com.au',
-                        'company_size': 'large'
-                    }
-                )
-                # Enrich company with logo and contact if missing
-                try:
-                    needs_update = any([
-                        not company_obj.logo,
-                        not company_obj.email,
-                        not company_obj.phone,
-                        not company_obj.address_line1,
-                    ])
-                    if needs_update:
-                        _, city, state, _ = self.parse_location(job_data.get('location_text', ''))
-                        info = self.fetch_company_details(target_city_hint=city or state)
-                        updated = False
-                        if info.get('logo') and not company_obj.logo:
-                            company_obj.logo = info['logo']
-                            updated = True
-                        if info.get('email') and not company_obj.email:
-                            company_obj.email = info['email']
-                            updated = True
-                        if info.get('phone') and not company_obj.phone:
-                            company_obj.phone = info['phone']
-                            updated = True
-                        if info.get('address_line1') and not company_obj.address_line1:
-                            company_obj.address_line1 = info['address_line1']
-                            updated = True
-                        if info.get('details_url') and not company_obj.details_url:
-                            company_obj.details_url = info['details_url']
-                            updated = True
-                        if updated:
-                            company_obj.save(update_fields=['logo', 'email', 'phone', 'address_line1', 'details_url', 'updated_at'])
-                except Exception as e:
-                    logger.debug(f"Could not enrich company details: {e}")
-                
-                # Parse salary
-                salary_min, salary_max, currency, salary_type, raw_text = self.parse_salary(
-                    job_data.get('salary_text', '')
-                )
-                
-                # Parse date
-                date_posted = self.parse_date(job_data.get('posted_ago', ''))
-                
-                # Determine job details from keywords
-                job_type = "full_time"  # Default
-                work_mode = ""
-                experience_level = ""
-                
-                keywords = job_data.get('keywords', [])
-                logger.info(f"[PROCESSING KEYWORDS] for '{job_data.get('job_title', '')}': {keywords}")
-                
-                for keyword in keywords:
-                    keyword_lower = keyword.lower().strip()
-                    
-                    # Map website job types to database job types
-                    if keyword_lower == 'permanent':
-                        job_type = "permanent"  # Keep as permanent instead of converting to full_time
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif keyword_lower == 'temporary':
-                        job_type = "temporary"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif keyword_lower == 'contract':
-                        job_type = "contract"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif 'part-time' in keyword_lower or 'part time' in keyword_lower:
-                        job_type = "part_time"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif 'casual' in keyword_lower:
-                        job_type = "casual"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif 'internship' in keyword_lower:
-                        job_type = "internship"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    elif 'freelance' in keyword_lower:
-                        job_type = "freelance"
-                        logger.info(f"   [JOB_TYPE] Set job_type: {job_type} (from: {keyword})")
-                    # Work modes
-                    elif 'hybrid' in keyword_lower or 'work from home' in keyword_lower or 'remote' in keyword_lower:
-                        work_mode = keyword
-                        logger.info(f"   [WORK_MODE] Set work_mode: {work_mode}")
-                    # Experience levels
-                    elif any(level in keyword_lower for level in ['senior', 'junior', 'graduate', 'executive', 'lead', 'manager']):
-                        experience_level = keyword
-                        logger.info(f"   [EXPERIENCE] Set experience_level: {experience_level}")
-                
-                # Automatic job categorization
-                job_category = JobCategorizationService.categorize_job(
-                    title=job_data.get('job_title', ''),
-                    description=BeautifulSoup(job_data.get('summary_html', '') or job_data.get('summary', ''), 'html.parser').get_text(' ', strip=True)
-                )
-                
-                # Create unique slug
-                base_slug = slugify(job_data.get('job_title', 'job'))
-                unique_slug = base_slug
-                counter = 1
-                while JobPosting.objects.filter(slug=unique_slug).exists():
-                    unique_slug = f"{base_slug}-{counter}"
-                    counter += 1
-                
-                # Create the JobPosting
-                # Extract skills/preferred skills from description (prefer bullet items under headings)
-                plain_text_for_skills = BeautifulSoup(job_data.get('summary_html', '') or job_data.get('summary', ''), 'html.parser').get_text(' ', strip=True)
-                skills_csv, preferred_csv = self.extract_skills_from_description(job_data.get('summary_html', ''), plain_text_for_skills)
-
-                job_posting = JobPosting.objects.create(
-                    title=job_data.get('job_title', ''),
-                    slug=unique_slug,
-                    description=job_data.get('summary_html', '') or job_data.get('summary', 'No description available'),
-                    company=company_obj,
-                    posted_by=self.system_user,
-                    location=location_obj,
-                    job_category=job_category,
-                    job_type=job_type,
-                    experience_level=experience_level,
-                    work_mode=work_mode,
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_currency=currency,
-                    salary_type=salary_type,
-                    salary_raw_text=raw_text,
-                    external_source='michaelpage.com.au',
-                    external_url=job_data.get('job_url', ''),
-                    status='active',
-                    posted_ago=job_data.get('posted_ago', ''),
-                    date_posted=date_posted,
-                    additional_info=job_data,
-                    skills=skills_csv,
-                    preferred_skills=preferred_csv
-                )
-                
-                logger.info(f"[SAVED TO DATABASE]")
-                logger.info(f"   Title: {job_posting.title}")
-                logger.info(f"   Company: {job_posting.company.name}")
-                logger.info(f"   Location: {job_posting.location.name if job_posting.location else 'Not specified'}")
-                logger.info(f"   Job Type: {job_posting.job_type}")
-                logger.info(f"   Work Mode: {job_posting.work_mode}")
-                logger.info(f"   Salary: {job_posting.salary_display}")
-                logger.info(f"   Category: {job_posting.job_category}")
-                logger.info(f"   URL: {job_posting.external_url}")
-                self.scraped_count += 1
-                return True
+                # Store all raw data for ETL processing
+                'raw_michaelpage_data': {
+                    'salary_min': str(salary_min) if salary_min else '',
+                    'salary_max': str(salary_max) if salary_max else '',
+                    'salary_currency': currency,
+                    'salary_type': salary_type,
+                    'keywords': ','.join(keywords) if keywords else '',
+                    'tags': ','.join(list(set(tags_list))[:15]),
+                    'scraper_version': 'MichaelPage-Simple-Australia-1.0-ETL',
+                    'country': country or 'Australia'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='michaelpage.com.au',
+                job_url=job_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                self.error_count += 1
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.duplicate_count += 1
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            logger.info(f"  Company: {staging_data['company_name']}")
+            logger.info(f"  Category: {staging_data['category']}")
+            logger.info(f"  Location: {staging_data['location']}")
+            logger.info(f"  Job Type: {job_type_display}")
+            logger.info(f"  Skills ({len(skills_csv.split(',')) if skills_csv else 0}): {skills_csv or 'Not specified'}")
+            
+            self.scraped_count += 1
+            return True
                 
         except Exception as e:
-            logger.error(f"Error saving job to database: {str(e)}")
+            logger.error(f"Error saving job to staging: {str(e)}")
+            logger.exception(e)
             self.error_count += 1
             return False
     
@@ -1456,23 +1562,267 @@ class SimpleMichaelPageScraper:
             raise
 
 
+def reset_database():
+    """Reset/clear all Michael Page jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='michaelpage.com.au').count()
+            StagingJob.objects.filter(external_source='michaelpage.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} Michael Page jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Michael Page jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.scraped_count,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicate_count,  # Scraper duplicates
+                    'errors': scraper.error_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='michaelpage.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending Michael Page jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='michaelpage.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} Michael Page jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='michaelpage.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='michaelpage.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'michaelpage.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.scraped_count,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicate_count
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.scraped_count,
+            total_processed=0,
+            total_duplicates=scraper.duplicate_count,
+            total_errors=scraper.error_count,
+            new_skills_added=0,
+            status='success' if scraper.error_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.scraped_count}")
+        print(f"   Duplicates: {scraper.duplicate_count}")
+        print(f"   Errors: {scraper.error_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function to run the simple scraper."""
-    print("🔍 Simple Michael Page Australia Job Scraper")
-    print("="*50)
+    import argparse
     
     # Parse command line arguments
-    max_jobs = None  # Default (unlimited)
-    if len(sys.argv) > 1:
-        try:
-            max_jobs = int(sys.argv[1])
-        except ValueError:
-            print("Invalid number of jobs. Using unlimited.")
+    parser = argparse.ArgumentParser(description='Michael Page Australia Simple Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Michael Page jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    print(f"Target: {max_jobs} jobs from Michael Page Australia")
+    args = parser.parse_args()
+    
+    print("🔍 Simple Michael Page Australia Job Scraper with ETL")
+    print("="*70)
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Michael Page jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    max_jobs = args.job_limit
+    if max_jobs:
+        print(f"Target: {max_jobs} jobs from Michael Page Australia")
+    else:
+        print("Target: All available jobs (unlimited)")
+    
     print("Method: Direct HTML parsing with 'Show more Jobs' pagination support")
-    print("Database: Professional structure with JobPosting, Company, Location")
-    print("="*50)
+    print("ETL Flow: Scraper → StagingJob → VaultJob + PortalJob → JobPosting")
+    print("="*70)
     
     # Create scraper instance
     scraper = SimpleMichaelPageScraper(job_limit=max_jobs)
@@ -1481,6 +1831,13 @@ def main():
         # Run the scraping process
         scraper.run()
         
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+        
     except KeyboardInterrupt:
         logger.info("Scraping interrupted by user")
     except Exception as e:
@@ -1488,27 +1845,53 @@ def main():
         raise
 
 
-def run(job_limit=None):
-    """Automation entrypoint for Michael Page simple scraper.
-
-    Creates the scraper and runs it without CLI args; returns a summary dict.
+def run(job_limit=200):
+    """Automation entrypoint for Michael Page simple scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
     """
     try:
+        # Run scraping
         scraper = SimpleMichaelPageScraper(job_limit=job_limit)
         scraper.run()
-        return {
-            'success': True,
+        
+        summary = {
             'jobs_scraped': scraper.scraped_count,
             'duplicate_count': scraper.duplicate_count,
-            'error_count': scraper.error_count,
-            'message': f'Successfully scraped {scraper.scraped_count} Michael Page jobs'
+            'error_count': scraper.error_count
+        }
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'summary': summary,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
+        return {
+            'success': True,
+            'summary': summary,
+            'message': 'Michael Page scraping and ETL completed'
+        }
+    except SystemExit as e:
+        return {
+            'success': int(getattr(e, 'code', 1)) == 0,
+            'exit_code': getattr(e, 'code', 1)
         }
     except Exception as e:
-        logger.error(f"Scraping failed in run(): {e}")
+        try:
+            logging.getLogger(__name__).error(f"Scraping failed in run(): {e}")
+        except Exception:
+            pass
         return {
             'success': False,
-            'error': str(e),
-            'message': f'Scraping failed: {e}'
+            'error': str(e)
         }
 
 if __name__ == "__main__":

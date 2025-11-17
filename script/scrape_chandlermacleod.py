@@ -1,16 +1,33 @@
 #!/usr/bin/env python
 """
-Chandler Macleod Job Scraper using Playwright
+Chandler Macleod Job Scraper using Playwright with ETL Pipeline
 
 This script scrapes job postings from Chandler Macleod's careers pages and stores
-them in the professional database structure with `JobPosting`, `Company`, and `Location` models.
+them in the professional database structure with ETL flow:
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
 
 References:
 - Search page: https://www.chandlermacleod.com/job-results#/
 - Example detail page: https://www.chandlermacleod.com/job-details/staffing-administrator-in-human-resources-jobs-1274352
 
 Usage:
-    python script/scrape_chandlermacleod.py [max_jobs]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python script/scrape_chandlermacleod.py --auto-etl           # Scrape all + auto ETL
+    python script/scrape_chandlermacleod.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python script/scrape_chandlermacleod.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=chandlermacleod.com  # Then run ETL
+    
+    # Other options
+    python script/scrape_chandlermacleod.py 100 --reset          # Clear staging first
+    python script/scrape_chandlermacleod.py                      # Scrape all jobs
     
 Optionally seed specific job detail URLs via env CHANDLER_START_URLS (comma-separated).
 """
@@ -27,6 +44,7 @@ from base64 import b64decode
 import json
 import html as html_lib
 from typing import Optional, List, Union
+from concurrent.futures import ThreadPoolExecutor
 
 # Django setup (mirror voyages script conventions)
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'australia_job_scraper.settings_dev')
@@ -52,6 +70,7 @@ from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.models import JobPosting
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 
 # Logging
@@ -353,7 +372,8 @@ class ChandlerMacleodScraper:
         return cleaned
 
     def clean_html_description(self, html: str) -> str:
-        """Clean HTML description while preserving structure for proper HTML format."""
+        """Clean HTML description while preserving structure for proper HTML format.
+        Removes all anchor tags/links from the HTML."""
         if not html:
             return ''
         
@@ -371,6 +391,10 @@ class ChandlerMacleodScraper:
         # Remove script and style tags
         html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove all anchor tags but keep their text content
+        # Replace <a href="...">text</a> with just text
+        html = re.sub(r'<a[^>]*>(.*?)</a>', r'\1', html, flags=re.DOTALL | re.IGNORECASE)
         
         # Convert to text temporarily to clean UI markers, then convert back to HTML-like structure
         text = self.html_to_text(html)
@@ -413,7 +437,8 @@ class ChandlerMacleodScraper:
         return result.strip()
 
     def generate_skills_from_description(self, description: str) -> tuple[str, str]:
-        """Extract skills and preferred skills from job description."""
+        """Extract skills and preferred skills from job description.
+        Returns exactly 4-6 skills in each category."""
         if not description:
             return '', ''
         
@@ -519,9 +544,38 @@ class ChandlerMacleodScraper:
         # Ensure skills don't appear in both lists
         preferred_skills = [s for s in preferred_skills if s not in required_skills]
         
-        # Join with commas and limit length
-        required_str = ', '.join(required_skills[:10])  # Limit to 10 skills
-        preferred_str = ', '.join(preferred_skills[:8])   # Limit to 8 skills
+        # Default skills if nothing found
+        if not required_skills:
+            required_skills = ['Communication', 'Teamwork', 'Problem Solving', 'Time Management', 'Attention To Detail']
+        if not preferred_skills:
+            preferred_skills = ['Leadership', 'Project Management', 'Strategic Planning', 'Customer Service', 'Adaptability']
+        
+        # Ensure exactly 4-6 skills in each list
+        if len(required_skills) < 4:
+            # Pad with default skills
+            defaults = ['Communication', 'Teamwork', 'Problem Solving', 'Time Management', 'Attention To Detail', 'Organization']
+            for skill in defaults:
+                if skill not in required_skills and len(required_skills) < 6:
+                    required_skills.append(skill)
+        elif len(required_skills) > 6:
+            required_skills = required_skills[:6]
+        
+        if len(preferred_skills) < 4:
+            # Pad with default skills
+            defaults = ['Leadership', 'Project Management', 'Strategic Planning', 'Customer Service', 'Adaptability', 'Innovation']
+            for skill in defaults:
+                if skill not in preferred_skills and skill not in required_skills and len(preferred_skills) < 6:
+                    preferred_skills.append(skill)
+        elif len(preferred_skills) > 6:
+            preferred_skills = preferred_skills[:6]
+        
+        # Final safety check - ensure 4-6 items
+        required_skills = required_skills[:6]
+        preferred_skills = preferred_skills[:6]
+        
+        # Join with commas
+        required_str = ', '.join(required_skills)
+        preferred_str = ', '.join(preferred_skills)
         
         return required_str, preferred_str
 
@@ -1084,54 +1138,87 @@ class ChandlerMacleodScraper:
             logger.error(f"Error extracting detail from {job_url}: {e}")
             return None
 
-    def save_job(self, data: dict) -> Optional[JobPosting]:
+    def save_job(self, data: dict) -> Optional[str]:
+        """Save job to StagingJob for ETL processing."""
         try:
-            with transaction.atomic():
-                existing = JobPosting.objects.filter(external_url=data['external_url']).first()
-                if existing:
-                    logger.info(f"Already exists, skipping: {existing.title}")
-                    return existing
-                # If we carried the original category text, ensure it's preserved in additional_info
-                job = JobPosting.objects.create(
-                    title=data['title'],
-                    description=data['description'],
-                    company=self.company,
-                    posted_by=self.scraper_user,
-                    location=data['location'],
-                    job_category=data['job_category'],
-                    job_type=data['job_type'],
-                    experience_level='',
-                    work_mode=data['work_mode'],
-                    salary_min=data['salary_min'],
-                    salary_max=data['salary_max'],
-                    salary_currency=data['salary_currency'],
-                    salary_type=data['salary_type'],
-                    salary_raw_text=data['salary_raw_text'],
-                    external_source='chandlermacleod.com',
-                    external_url=data['external_url'],
-                    external_id=data['external_id'],
-                    status='active',
-                    posted_ago=data['posted_ago'],
-                    date_posted=data['date_posted'],
-                    tags='',
-                    skills=data.get('skills', ''),
-                    preferred_skills=data.get('preferred_skills', ''),
-                    additional_info={
-                        'scraped_from': 'chandler_macleod',
-                        'scraper_version': '1.0'
-                    }
-                )
-                # Merge category_raw into additional_info if present
-                if data.get('category_raw'):
-                    info = job.additional_info or {}
-                    info['category_raw'] = data['category_raw']
-                    job.additional_info = info
-                    job.save(update_fields=['additional_info'])
-                logger.info(f"Saved job: {job.title}")
-                return job
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'freelance': 'Freelance'
+            }
+            job_type = job_type_map.get(data.get('job_type', 'full_time'), 'Full-time')
+            
+            # Convert date to string for JSON serialization
+            posted_date_str = ''
+            if data.get('date_posted'):
+                if hasattr(data['date_posted'], 'isoformat'):
+                    posted_date_str = data['date_posted'].isoformat()
+                else:
+                    posted_date_str = str(data['date_posted'])
+            
+            # Prepare staging data
+            staging_data = {
+                'title': data['title'],
+                'description': data['description'],
+                'company_name': self.company.name,
+                'location': data['location'].name if data.get('location') else 'Australia',
+                'salary': data.get('salary_raw_text', ''),
+                'job_type': job_type,
+                'category': data.get('job_category', 'other'),
+                'posted_ago': data.get('posted_ago', ''),
+                
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': data.get('work_mode', 'on_site'),
+                'skills': data.get('skills', ''),
+                'preferred_skills': data.get('preferred_skills', ''),
+                'posted_date': posted_date_str,
+                'experience_level': 'mid_level',
+                
+                # Store all raw data for ETL processing
+                'raw_chandler_data': {
+                    'salary_min': str(data.get('salary_min', '')) if data.get('salary_min') else '',
+                    'salary_max': str(data.get('salary_max', '')) if data.get('salary_max') else '',
+                    'salary_currency': data.get('salary_currency', 'AUD'),
+                    'salary_type': data.get('salary_type', 'yearly'),
+                    'category_raw': data.get('category_raw', ''),
+                    'scraper_version': 'Chandler-Macleod-Playwright-1.0-ETL',
+                    'country': 'Australia'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='chandlermacleod.com',
+                job_url=data['external_url'],
+                job_data=staging_data,
+                external_id=data['external_id']
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {data['title']}")
+                return None
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {data['title']}")
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {data['title']}")
+            logger.info(f"  Company: {staging_data['company_name']}")
+            logger.info(f"  Category: {staging_data['category']}")
+            logger.info(f"  Location: {staging_data['location']}")
+            
+            return "success"
+                
         except Exception as e:
-            logger.error(f"DB save error: {e}")
-        return None
+            logger.error(f"Error saving job to staging: {e}")
+            return None
     
     def scrape(self) -> int:
         logger.info("Starting Chandler Macleod scraping...")
@@ -1192,21 +1279,276 @@ class ChandlerMacleodScraper:
         return self.scraped_count
 
 
-def main():
-    max_jobs = None
-    if len(sys.argv) > 1:
+def reset_database():
+    """Reset/clear all Chandler Macleod Jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
         try:
-            max_jobs = int(sys.argv[1])
-        except ValueError:
-            logger.error("Invalid max_jobs argument. Provide an integer.")
-            sys.exit(1)
-
-    scraper = ChandlerMacleodScraper(max_jobs=max_jobs, headless=True)
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='chandlermacleod.com').count()
+            StagingJob.objects.filter(external_source='chandlermacleod.com').delete()
+            logger.info(f"[RESET] Cleared {deleted_count} Chandler Macleod jobs from staging")
+            return True
+        except Exception as e:
+            logger.error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
     try:
-        scraper.scrape()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Chandler Macleod jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.scraped_count,
+                    'duplicates_found': 0,  # Tracked in staging
+                    'errors': 0
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='chandlermacleod.com',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending Chandler Macleod jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='chandlermacleod.com', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} Chandler Macleod jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='chandlermacleod.com')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='chandlermacleod.com', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logger.error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'chandlermacleod.com'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.scraped_count,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.scraped_count,
+            total_processed=0,
+            total_duplicates=0,
+            total_errors=0,
+            new_skills_added=0,
+            status='success',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.scraped_count}")
+        print(f"   Duplicates: 0")
+        print(f"   Errors: 0")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def main():
+    """Main function with ETL support."""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Chandler Macleod Professional Scraper with ETL')
+    parser.add_argument('max_jobs', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Chandler Macleod jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
+    
+    args = parser.parse_args()
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Chandler Macleod jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    max_jobs = args.max_jobs
+    if max_jobs:
+        logger.info(f"Job limit set to: {max_jobs}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    # Initialize and run scraper
+    try:
+        scraper = ChandlerMacleodScraper(max_jobs=max_jobs, headless=True)
+        scraper.scrape()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
@@ -1214,14 +1556,28 @@ if __name__ == "__main__":
 
 
 def run(max_jobs=None):
-    """Automation entrypoint for Chandler Macleod scraper."""
+    """Automation entrypoint for Chandler Macleod scraper with auto-ETL."""
     try:
+        # Run scraping
         scraper = ChandlerMacleodScraper(max_jobs=max_jobs, headless=True)
         count = scraper.scrape()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logger.error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'jobs_scraped': count,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'jobs_scraped': count,
-            'message': f'Chandler Macleod scraping completed, saved {count} jobs'
+            'message': f'Chandler Macleod scraping and ETL completed'
         }
     except SystemExit as e:
         return {

@@ -1,16 +1,48 @@
 #!/usr/bin/env python3
 """
-JobAtlas Australia Job Scraper using Playwright
-================================================
+JobAtlas Australia Job Scraper using Playwright with ETL Pipeline
+==================================================================
 
 Scrapes listings from https://www.jobatlas.com.au/jobs. For each card, it opens
 the detail page (external site like careerjet/jobatlas detail) to extract the
-full job description, then saves to Django models `JobPosting`, `Company`, and
-`Location` with duplicate checks and categorization via
-`apps.jobs.services.JobCategorizationService`.
+full job description, then saves to StagingJob for ETL processing.
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
+- Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
+- Professional database structure (JobPosting, Company, Location)
+- Automatic job categorization using JobCategorizationService
+- Human-like behavior to avoid detection
+- Comprehensive error handling and logging
+- ETL-ready data saved to StagingJob table
 
 Usage:
-    python jobatlas_australia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python jobatlas_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python jobatlas_australia_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python jobatlas_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=jobatlas.com.au  # Then run ETL
+    
+    # Other options
+    python jobatlas_australia_scraper.py 100 --reset          # Clear staging first
+    python jobatlas_australia_scraper.py                      # Scrape all jobs
+
+Examples:
+    python jobatlas_australia_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python jobatlas_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python jobatlas_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -41,6 +73,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 
 User = get_user_model()
@@ -953,85 +986,131 @@ class JobAtlasAustraliaScraper:
 
     # -------------- Persistence --------------
     def _save_job(self, job: dict) -> bool:
+        """Save job to StagingJob for ETL processing."""
         try:
             connections.close_all()
-            with transaction.atomic():
-                if job.get('external_url') and JobPosting.objects.filter(external_url=job['external_url']).exists():
-                    self.duplicates += 1
-                    return False
+            
+            # Validation
+            job_title = job.get('title', '').strip()
+            job_url = job.get('external_url', '')
+            
+            if not job_title or not job_url:
+                self.logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.errors += 1
+                return False
+            
+            # Parse salary information
+            salary_min, salary_max, salary_currency, salary_type = self._parse_salary(job.get('salary_text'))
+            
+            # Categorize job
+            job_category = JobCategorizationService.categorize_job(
+                job.get('title', ''), 
+                job.get('description', '')
+            )
+            
+            # Generate tags
+            tags_list = JobCategorizationService.get_job_keywords(
+                job.get('title', ''), 
+                job.get('description', '')
+            )
+            
+            # Derive skills and preferred skills from description
+            provided_skills = (job.get('skills') or '').strip()
+            provided_pref = (job.get('preferred_skills') or '').strip()
+            if not provided_skills or not provided_pref:
+                try:
+                    desc_html = job.get('description', '') or job.get('summary', '')
+                    skills_str, preferred_str = self._extract_skills_from_description(job.get('title', ''), desc_html)
+                    if not provided_skills:
+                        provided_skills = skills_str
+                    if not provided_pref:
+                        provided_pref = preferred_str
+                except Exception:
+                    pass
 
-                company = self._get_or_create_company(job.get('company_name') or 'Unknown Company')
-                location = self._get_or_create_location(job.get('location'))
-
-                salary_min, salary_max, salary_currency, salary_type = self._parse_salary(job.get('salary_text'))
-
-                category = JobCategorizationService.categorize_job(job.get('title', ''), job.get('description', ''))
-                tags = ','.join(JobCategorizationService.get_job_keywords(job.get('title', ''), job.get('description', ''))[:10])
-
-                # Unique slug title-company
-                base_slug = slugify(job.get('title', 'job'))
-                company_part = slugify(company.name if company else 'company')
-                unique_slug = f"{base_slug}-{company_part}"
-                counter = 1
-                while JobPosting.objects.filter(slug=unique_slug).exists():
-                    unique_slug = f"{base_slug}-{company_part}-{counter}"
-                    counter += 1
-
-                # Derive skills and preferred skills from description if not provided
-                provided_skills = (job.get('skills') or '').strip()
-                provided_pref = (job.get('preferred_skills') or '').strip()
-                if not provided_skills or not provided_pref:
-                    try:
-                        desc_html = job.get('description', '') or job.get('summary', '')
-                        skills_str, preferred_str = self._extract_skills_from_description(job.get('title', ''), desc_html)
-                        if not provided_skills:
-                            provided_skills = skills_str
-                        if not provided_pref:
-                            provided_pref = preferred_str
-                    except Exception:
-                        pass
-
-                # Ensure both fields are always populated
-                if provided_skills and not provided_pref:
-                    provided_pref = provided_skills
-                if provided_pref and not provided_skills:
-                    provided_skills = provided_pref
-                if not provided_skills and not provided_pref:
-                    # Fall back to tags or title keywords
-                    fallback = tags or (job.get('title', '') or '')
-                    provided_skills = fallback
-                    provided_pref = fallback
-
-                JobPosting.objects.create(
-                    title=job.get('title', '')[:200],
-                    slug=unique_slug,
-                    description=job.get('description', '') or job.get('summary', ''),
-                    company=company,
-                    location=location,
-                    posted_by=self.bot_user,
-                    job_category=category,
-                    job_type='full_time',
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_currency=salary_currency,
-                    salary_type=salary_type,
-                    salary_raw_text=job.get('salary_text', '')[:200],
-                    external_source='jobatlas.com.au',
-                    external_url=job.get('external_url', ''),
-                    date_posted=timezone.now(),
-                    posted_ago=job.get('posted_date', '')[:50],
-                    status='active',
-                    tags=tags,
-                    additional_info={'scraper_version': 'Playwright-JobAtlas-1.0'},
-                    skills=(provided_skills or '')[:200],
-                    preferred_skills=(provided_pref or '')[:200]
-                )
-
-                self.jobs_saved += 1
-                return True
+            # Ensure both fields are always populated
+            if provided_skills and not provided_pref:
+                provided_pref = provided_skills
+            if provided_pref and not provided_skills:
+                provided_skills = provided_pref
+            if not provided_skills and not provided_pref:
+                # Fall back to tags or title keywords
+                fallback = ','.join(tags_list[:10]) or (job.get('title', '') or '')
+                provided_skills = fallback
+                provided_pref = fallback
+            
+            # Handle external URL
+            external_url = job_url.strip()
+            if not external_url:
+                timestamp = int(datetime.now().timestamp())
+                external_url = f"https://jobatlas.com.au/job/{slugify(job_title)}-{timestamp}/"
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = external_url.split('/')[-2] if external_url.endswith('/') else external_url.split('/')[-1]
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job.get('description', '') or job.get('summary', ''),
+                'company_name': job.get('company_name', 'Unknown Company'),
+                'location': job.get('location', 'Australia'),
+                'salary': job.get('salary_text', ''),
+                'job_type': 'Full-time',
+                'category': job_category,
+                'posted_ago': job.get('posted_date', ''),
+                
+                # Additional fields
+                'employment_type': 'Full-time',
+                'work_mode': 'on_site',
+                'skills': (provided_skills or '')[:200],
+                'preferred_skills': (provided_pref or '')[:200],
+                'closing_date': '',
+                'posted_date': '',
+                'experience_level': 'mid_level',
+                
+                # Store all raw data for ETL processing
+                'raw_jobatlas_data': {
+                    'salary_min': str(salary_min) if salary_min else '',
+                    'salary_max': str(salary_max) if salary_max else '',
+                    'salary_currency': salary_currency,
+                    'salary_type': salary_type,
+                    'tags': ','.join(list(set(tags_list))[:15]),
+                    'scraper_version': 'Playwright-JobAtlas-1.0-ETL',
+                    'country': 'Australia'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='jobatlas.com.au',
+                job_url=external_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                self.logger.error(f"Failed to save to staging: {job_title}")
+                self.errors += 1
+                return False
+            
+            if not created:
+                self.logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.duplicates += 1
+                return "duplicate"
+            
+            # Success - log details
+            self.logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            self.logger.info(f"  Company: {staging_data['company_name']}")
+            self.logger.info(f"  Category: {staging_data['category']}")
+            self.logger.info(f"  Location: {staging_data['location']}")
+            
+            self.jobs_saved += 1
+            return True
+            
         except Exception as e:
             self.errors += 1
             self.logger.error(f"Save error: {e}")
+            self.logger.exception(e)
             return False
 
     # Thread-safe wrapper to avoid Django async context errors
@@ -1128,25 +1207,159 @@ class JobAtlasAustraliaScraper:
         self.logger.info(f"JobAtlas done. Scraped={self.jobs_scraped}, Saved={self.jobs_saved}, Dups={self.duplicates}, Errors={self.errors}, Duration={duration}")
 
 
-def main():
-    job_limit = None
-    if len(sys.argv) > 1:
+def reset_database():
+    """Reset/clear all JobAtlas jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
         try:
-            job_limit = int(sys.argv[1])
-        except Exception:
-            job_limit = None
-    scraper = JobAtlasAustraliaScraper(job_limit=job_limit, headless=True)
-    scraper.run(max_pages=10)
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='jobatlas.com.au').count()
+            StagingJob.objects.filter(external_source='jobatlas.com.au').delete()
+            logging.getLogger(__name__).info(f"[RESET] Cleared {deleted_count} JobAtlas jobs from staging")
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing():
+    """Run ETL processing on scraped JobAtlas jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='jobatlas.com.au',
+                is_processed=False
+            ).count()
+            
+            if pending_count == 0:
+                logging.getLogger(__name__).info("No pending JobAtlas jobs to process in staging")
+                return {'successful': 0, 'failed': 0, 'duplicates': 0}
+            
+            logging.getLogger(__name__).info(f"Found {pending_count} JobAtlas jobs pending ETL processing")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='jobatlas.com.au')
+            
+            logging.getLogger(__name__).info(f"ETL completed - Processed: {results['successful']}, Failed: {results['failed']}, Duplicates: {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            logging.getLogger(__name__).error(f"ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logging.getLogger(__name__).error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def main():
+    """Main function with ETL support."""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='JobAtlas Australia Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing JobAtlas jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
+    
+    args = parser.parse_args()
+    
+    logger = logging.getLogger(__name__)
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing JobAtlas jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    job_limit = args.job_limit
+    if job_limit:
+        logger.info(f"Job limit set to: {job_limit}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    # Initialize and run scraper
+    try:
+        scraper = JobAtlasAustraliaScraper(job_limit=job_limit, headless=True)
+        scraper.run(max_pages=10)
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing()
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 def run(job_limit=300, max_pages=10):
-    """Automation entrypoint for JobAtlas Australia scraper."""
+    """Automation entrypoint for JobAtlas Australia scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
+    """
     try:
+        # Run scraping
         scraper = JobAtlasAustraliaScraper(job_limit=job_limit, headless=True)
         scraper.run(max_pages=max_pages)
+        
+        # Build summary
+        summary = {
+            'jobs_scraped': scraper.jobs_scraped,
+            'jobs_saved': scraper.jobs_saved,
+            'duplicates': scraper.duplicates,
+            'errors': scraper.errors
+        }
+        
+        # Automatically run ETL processing for scheduler
+        try:
+            run_etl_processing()
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'summary': summary,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
-            'message': 'JobAtlas scraping completed'
+            'summary': summary,
+            'message': 'JobAtlas scraping and ETL completed'
         }
     except SystemExit as e:
         return {

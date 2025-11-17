@@ -1,5 +1,50 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+Enhanced WorkinAUS Job Scraper with ETL Pipeline Integration
+=============================================================
+
+Professional scraper for WorkinAUS (https://workinaus.com.au) that integrates 
+with the ETL pipeline for proper data flow:
+
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Features:
+- Uses Playwright for reliable scraping
+- Saves to StagingJob table (ETL first stage)
+- Extracts 4-6 skills and 4-6 preferred skills per job
+- Automatic job categorization
+- Full pagination support
+- Human-like behavior
+- Comprehensive error handling
+
+Usage:
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python workinaus_job_scraper_enhanced.py 50 --auto-etl      # Scrape 50 + auto ETL
+    python workinaus_job_scraper_enhanced.py --auto-etl         # Scrape 5 + auto ETL
+    
+    # Two-step manual process
+    python workinaus_job_scraper_enhanced.py 30                 # Scrape only
+    python manage.py run_etl_pipeline --source=workinaus.com.au # Then run ETL
+    
+    # Other options
+    python workinaus_job_scraper_enhanced.py 100 --reset        # Clear staging first
+    python workinaus_job_scraper_enhanced.py --category=tech    # Filter by category
+    python workinaus_job_scraper_enhanced.py --location=sydney  # Filter by location
+
+Examples:
+    python workinaus_job_scraper_enhanced.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python workinaus_job_scraper_enhanced.py --auto-etl        # Scrape 5 jobs + ETL
+    python workinaus_job_scraper_enhanced.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
+"""
 
 import os
 import sys
@@ -34,6 +79,7 @@ from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.models import JobPosting
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 print("Django imports completed")
 
@@ -194,7 +240,9 @@ class WorkinAUSScraperEnhanced:
         return html_content
 
     def extract_skills_from_description(self, description):
-        """Extract skills and preferred skills from job description using keyword matching."""
+        """Extract skills and preferred skills from job description using keyword matching.
+        Returns tuple (skills_list, preferred_skills_list) with 4-6 items each.
+        """
         if not description:
             return [], []
         
@@ -247,11 +295,60 @@ class WorkinAUSScraperEnhanced:
                 else:
                     found_skills.append(skill.title())
         
-        # Remove duplicates and limit to reasonable numbers
-        found_skills = list(set(found_skills))[:10]  # Limit to 10 main skills
-        preferred_skills = list(set(preferred_skills))[:5]  # Limit to 5 preferred skills
+        # Remove duplicates
+        found_skills = list(set(found_skills))
+        preferred_skills = list(set(preferred_skills))
         
-        return found_skills, preferred_skills
+        # If we don't have enough combined skills, add default skills
+        total_skills = found_skills + preferred_skills
+        if len(total_skills) < 8:
+            default_skills = [
+                'Communication', 'Teamwork', 'Problem Solving', 'Time Management',
+                'Attention To Detail', 'Organizational Skills', 'Customer Service', 'Planning'
+            ]
+            for skill in default_skills:
+                if skill not in total_skills and len(total_skills) < 12:
+                    found_skills.append(skill)
+                    total_skills.append(skill)
+        
+        # Split into two lists with 4-6 items each
+        combined = found_skills + preferred_skills
+        mid_point = len(combined) // 2
+        if mid_point < 4:
+            mid_point = min(4, len(combined))
+        
+        skills_list = combined[:mid_point]
+        preferred_list = combined[mid_point:]
+        
+        # Ensure both have 4-6 items
+        if len(skills_list) < 4:
+            # Add from preferred to skills
+            while len(skills_list) < 4 and len(preferred_list) > 4:
+                skills_list.append(preferred_list.pop(0))
+        
+        if len(preferred_list) < 4:
+            # Add from skills to preferred
+            while len(preferred_list) < 4 and len(skills_list) > 4:
+                preferred_list.append(skills_list.pop())
+        
+        # Final fallback - ensure both have at least 4 items
+        if len(skills_list) < 4:
+            default_skills = ['Communication', 'Teamwork', 'Problem Solving', 'Time Management']
+            for i, skill in enumerate(default_skills):
+                if len(skills_list) <= i:
+                    skills_list.append(skill)
+        
+        if len(preferred_list) < 4:
+            default_preferred = ['Organizational Skills', 'Attention To Detail', 'Customer Service', 'Planning']
+            for i, skill in enumerate(default_preferred):
+                if len(preferred_list) <= i:
+                    preferred_list.append(skill)
+        
+        # Limit to maximum 6 items each
+        skills_list = skills_list[:6]
+        preferred_list = preferred_list[:6]
+        
+        return skills_list, preferred_list
 
     def _get_skill_context(self, description, skill):
         """Get the context around a skill mention to determine if it's required or preferred."""
@@ -737,106 +834,122 @@ class WorkinAUSScraperEnhanced:
             return 0
 
     def save_job_to_database_sync(self, job_data):
-        """Save job data to database synchronously."""
+        """Save job to StagingJob for ETL processing (synchronous version for thread execution)."""
         try:
-            with transaction.atomic():
-                # Check for duplicates by title + company combination
-                existing = JobPosting.objects.filter(
-                    title=job_data.get('job_title', ''),
-                    company__name=job_data.get('company_name', ''),
-                    external_source='workinaus.com.au'
-                ).first()
+            # Validation
+            job_title = job_data.get('job_title', '').strip()
+            company_name = job_data.get('company_name', '').strip()
+            
+            if not job_title or not company_name:
+                logger.warning(f"Missing required fields (title or company) for job: {job_title}")
+                self.error_count += 1
+                return False
+            
+            # Parse salary if available
+            salary_min, salary_max = None, None
+            if job_data.get('salary_text'):
+                salary_min, salary_max = self.parse_salary(job_data['salary_text'])
+            
+            # Generate a unique external URL
+            import hashlib
+            unique_data = f"{job_title}-{company_name}-{job_data.get('location_text', '')}"
+            url_hash = hashlib.md5(unique_data.encode()).hexdigest()[:8]
+            external_url = f"https://workinaus.com.au/job/generated-{url_hash}"
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = f"workinaus-{url_hash}"
+            
+            # Determine job category using title and description
+            job_category = self._categorize_job(job_title, job_data.get('summary', ''))
+            
+            # Process posting and closing dates
+            posted_date_str = ''
+            if job_data.get('posted_date'):
+                parsed_posting_date = self.parse_specific_date(job_data['posted_date'])
+                if parsed_posting_date:
+                    posted_date_str = parsed_posting_date.isoformat()
+            
+            if not posted_date_str and job_data.get('posted_ago'):
+                parsed_posting_date = self.parse_date(job_data.get('posted_ago'))
+                if parsed_posting_date:
+                    posted_date_str = parsed_posting_date.isoformat()
+            
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'freelance': 'Freelance'
+            }
+            mapped_job_type = self._map_job_type(job_data.get('job_type_text', ''))
+            job_type = job_type_map.get(mapped_job_type, 'Full-time')
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_data.get('html_description', job_data.get('summary', '')),
+                'company_name': company_name,
+                'location': job_data.get('location_text', 'Australia'),
+                'salary': job_data.get('salary_text', ''),
+                'job_type': job_type,
+                'category': job_category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                if existing:
-                    self.duplicate_count += 1
-                    logger.info(f"Duplicate job found: {job_data.get('job_title', 'Unknown')} at {job_data.get('company_name', 'Unknown')}")
-                    return existing
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': 'on_site',
+                'skills': job_data.get('skills', ''),
+                'preferred_skills': job_data.get('preferred_skills', ''),
+                'closing_date': job_data.get('closing_date', ''),
+                'posted_date': posted_date_str,
+                'experience_level': 'mid_level',
                 
-                # Get or create company
-                company = None
-                if job_data.get('company_name'):
-                    company, _ = Company.objects.get_or_create(
-                        name=job_data['company_name'],
-                        defaults={
-                            'description': f'Company from WorkinAUS scraper',
-                            'website': '',
-                            'company_size': 'medium'
-                        }
-                    )
-                
-                # Get or create location
-                location = None
-                if job_data.get('location_text'):
-                    location_name = job_data['location_text']
-                    location, _ = Location.objects.get_or_create(
-                        name=location_name,
-                        defaults={
-                            'country': 'Australia',
-                            'state': location_name if any(state in location_name for state in ['NSW', 'VIC', 'QLD', 'WA', 'SA', 'TAS', 'ACT', 'NT']) else ''
-                        }
-                    )
-                
-                # Parse salary if available
-                salary_min, salary_max = None, None
-                if job_data.get('salary_text'):
-                    salary_min, salary_max = self.parse_salary(job_data['salary_text'])
-                
-                # Generate a unique external URL
-                import hashlib
-                unique_data = f"{job_data.get('job_title', '')}-{job_data.get('company_name', '')}-{job_data.get('location_text', '')}"
-                url_hash = hashlib.md5(unique_data.encode()).hexdigest()[:8]
-                external_url = f"https://workinaus.com.au/job/generated-{url_hash}"
-                
-                # Determine job category using title and description
-                job_category = self._categorize_job(job_data.get('job_title', ''), job_data.get('summary', ''))
-                
-                # Process posting and closing dates
-                parsed_posting_date = None
-                
-                # Try to parse the posted_date first (from card extraction)
-                if job_data.get('posted_date'):
-                    parsed_posting_date = self.parse_specific_date(job_data['posted_date'])
-                    logger.info(f"Parsed posting date from card: {job_data['posted_date']} -> {parsed_posting_date}")
-                
-                # Fallback to parsing posted_ago text or current time
-                if not parsed_posting_date:
-                    parsed_posting_date = self.parse_date(job_data.get('posted_ago')) or timezone.now()
-                    logger.info(f"Using fallback posting date: {parsed_posting_date}")
-                
-                # Log closing date if available
-                if job_data.get('closing_date'):
-                    logger.info(f"Found closing date: {job_data['closing_date']}")
-                
-                # Create job posting
-                job_posting = JobPosting.objects.create(
-                    title=job_data.get('job_title', 'Unknown Position'),
-                    company=company,
-                    location=location,
-                    description=job_data.get('html_description', job_data.get('summary', '')),
-                    external_url=external_url,
-                    salary_min=salary_min,
-                    salary_max=salary_max,
-                    salary_currency='AUD',
-                    salary_type='yearly',
-                    salary_raw_text=job_data.get('salary_text', ''),
-                    job_type=self._map_job_type(job_data.get('job_type_text', '')),
-                    job_category=job_category,
-                    date_posted=parsed_posting_date,
-                    posted_by=self.system_user,
-                    external_source='workinaus.com.au',
-                    status='active',
-                    posted_ago=job_data.get('posted_ago', ''),
-                    skills=job_data.get('skills', ''),
-                    preferred_skills=job_data.get('preferred_skills', ''),
-                    job_closing_date=job_data.get('closing_date', ''),
-                    additional_info=job_data
-                )
-                
-                return job_posting
+                # Store all raw data for ETL processing
+                'raw_workinaus_data': {
+                    'salary_min': str(salary_min) if salary_min else '',
+                    'salary_max': str(salary_max) if salary_max else '',
+                    'salary_currency': 'AUD',
+                    'salary_type': 'yearly',
+                    'job_type_badge': job_data.get('job_type_text', ''),
+                    'scraper_version': 'WorkinAUS-Playwright-Australia-1.0-ETL',
+                    'country': 'Australia'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='workinaus.com.au',
+                job_url=external_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                self.error_count += 1
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.duplicate_count += 1
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            logger.info(f"  Company: {company_name}")
+            logger.info(f"  Category: {job_category}")
+            logger.info(f"  Location: {staging_data['location']}")
+            
+            return True
                 
         except Exception as e:
-            logger.error(f"Error saving job to database: {e}")
-            return None
+            logger.error(f"Error saving job to staging: {e}")
+            logger.exception(e)
+            self.error_count += 1
+            return False
 
     def save_job_to_database(self, job_data):
         """Save job data to database with thread safety."""
@@ -1080,47 +1193,285 @@ class WorkinAUSScraperEnhanced:
                 browser.close()
 
 
+def reset_database():
+    """Reset/clear all WorkinAUS Jobs data from staging."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _reset_in_thread():
+        """Execute database reset in a separate thread to avoid async context issues."""
+        try:
+            from apps.jobs.models import StagingJob
+            deleted_count = StagingJob.objects.filter(external_source='workinaus.com.au').count()
+            StagingJob.objects.filter(external_source='workinaus.com.au').delete()
+            logger.info(f"[RESET] Cleared {deleted_count} WorkinAUS jobs from staging")
+            return True
+        except Exception as e:
+            logger.error(f"[RESET] Failed to clear staging: {e}")
+            return False
+    
+    # Execute reset in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_reset_in_thread)
+            return future.result(timeout=30)
+    except Exception as e:
+        logger.error(f"[RESET] Thread execution failed: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped WorkinAUS jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def _run_etl_in_thread():
+        """Execute ETL processing in a separate thread to avoid async context issues."""
+        try:
+            print("")
+            print("=" * 70)
+            print("🔄 STARTING ETL PROCESSING")
+            print("=" * 70)
+            print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+            print("")
+            
+            # Import ETL processor
+            from apps.jobs.etl_processor import ETLProcessor
+            from apps.jobs.models import StagingJob
+            
+            # Get scraper statistics (always record, even if no new jobs)
+            scraper_stats = None
+            if scraper:
+                scraper_stats = {
+                    'jobs_scraped': scraper.scraped_count,  # Jobs saved to staging
+                    'duplicates_found': scraper.duplicate_count,  # Scraper duplicates
+                    'errors': scraper.error_count
+                }
+            
+            # Check if there are jobs to process
+            pending_count = StagingJob.objects.filter(
+                external_source='workinaus.com.au',
+                is_processed=False
+            ).count()
+            
+            # Initialize empty results for when no ETL processing happens
+            results = {
+                'successful': 0,
+                'failed': 0,
+                'duplicates': 0,
+                'new_skills': 0
+            }
+            
+            if pending_count == 0:
+                print("No pending WorkinAUS jobs to process in staging")
+                # Still create summary record even if no ETL processing
+                create_job_ingestion_summary(results, source='workinaus.com.au', scraper_stats=scraper_stats)
+                return results
+            
+            print(f"Found {pending_count} WorkinAUS jobs pending ETL processing...")
+            
+            # Run ETL processor
+            processor = ETLProcessor()
+            results = processor.process_staging_jobs(source='workinaus.com.au')
+            
+            # Create or update JobIngestionSummary record
+            create_job_ingestion_summary(results, source='workinaus.com.au', scraper_stats=scraper_stats)
+            
+            # Print only final results
+            print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+            raise
+    
+    # Execute ETL in a separate thread to avoid async context issues
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_etl_in_thread)
+            return future.result(timeout=300)  # 5 minute timeout
+    except Exception as e:
+        logger.error(f"ETL THREAD EXECUTION FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'workinaus.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.scraped_count,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.duplicate_count
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.scraped_count,
+            total_processed=0,
+            total_duplicates=scraper.duplicate_count,
+            total_errors=scraper.error_count,
+            new_skills_added=0,
+            status='success' if scraper.error_count == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.scraped_count}")
+        print(f"   Duplicates: {scraper.duplicate_count}")
+        print(f"   Errors: {scraper.error_count}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function to run the enhanced scraper."""
-    print("🔍 Enhanced WorkinAUS Job Scraper with Detailed Descriptions")
+    import argparse
+    
+    print("🔍 Enhanced WorkinAUS Job Scraper with ETL Flow")
     print("="*60)
     
     # Parse command line arguments
-    job_limit = 5  # Default
-    job_category = "all"
-    location = "all"
+    parser = argparse.ArgumentParser(description='WorkinAUS Enhanced Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=5,
+                       help='Maximum number of jobs to scrape (default: 5)')
+    parser.add_argument('--category', type=str, default='all',
+                       help='Job category to scrape (default: all)')
+    parser.add_argument('--location', type=str, default='all',
+                       help='Location to scrape (default: all)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing WorkinAUS jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    if len(sys.argv) > 1:
-        try:
-            job_limit = int(sys.argv[1])
-            print(f"Job limit from command line: {job_limit}")
-        except ValueError:
-            print("Invalid job limit. Using default: 5")
+    args = parser.parse_args()
     
-    if len(sys.argv) > 2:
-        job_category = sys.argv[2].lower()
-        print(f"Job category from command line: {job_category}")
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing WorkinAUS jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
     
-    if len(sys.argv) > 3:
-        location = sys.argv[3].lower()
-        print(f"Location from command line: {location}")
-    
-    print(f"Target: {job_limit} jobs")
-    print(f"Category: {job_category}")
-    print(f"Location: {location}")
-    print("Enhancement: Clicking on cards to extract full detailed descriptions")
+    print(f"Target: {args.job_limit} jobs")
+    print(f"Category: {args.category}")
+    print(f"Location: {args.location}")
+    print(f"Auto-ETL: {'Yes' if args.auto_etl else 'No'}")
     print("="*60)
 
     scraper = WorkinAUSScraperEnhanced(
         headless=True,
-        job_limit=job_limit,
-        job_category=job_category,
-        location=location
+        job_limit=args.job_limit,
+        job_category=args.category,
+        location=args.location
     )
     
     try:
         scraper.run()
         print("Enhanced scraper completed successfully!")
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
     except KeyboardInterrupt:
         print("Interrupted by user")
         logger.info("Interrupted by user")
@@ -1135,8 +1486,13 @@ if __name__ == "__main__":
 
 
 def run(job_limit=50, job_category="all", location="all"):
-    """Automation entrypoint for WorkinAUS enhanced scraper."""
+    """Automation entrypoint for WorkinAUS enhanced scraper with auto-ETL.
+    
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns the internal stats dict for schedulers.
+    """
     try:
+        # Run scraping
         scraper = WorkinAUSScraperEnhanced(
             headless=True,
             job_limit=job_limit,
@@ -1144,12 +1500,32 @@ def run(job_limit=50, job_category="all", location="all"):
             location=location
         )
         scraper.run()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logger.error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'jobs_scraped': scraper.scraped_count,
+                'duplicate_count': scraper.duplicate_count,
+                'error_count': scraper.error_count,
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
-            'jobs_scraped': getattr(scraper, 'scraped_count', None),
-            'duplicate_count': getattr(scraper, 'duplicate_count', None),
-            'error_count': getattr(scraper, 'error_count', None),
-            'message': 'WorkinAUS enhanced scraping completed'
+            'jobs_scraped': scraper.scraped_count,
+            'duplicate_count': scraper.duplicate_count,
+            'error_count': scraper.error_count,
+            'message': 'WorkinAUS scraping and ETL completed'
+        }
+    except SystemExit as e:
+        return {
+            'success': int(getattr(e, 'code', 1)) == 0,
+            'exit_code': getattr(e, 'code', 1)
         }
     except Exception as e:
         try:

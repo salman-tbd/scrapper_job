@@ -36,7 +36,7 @@ services:
       - RUNNING_IN_DOCKER=1
       - DB_NAME=${DB_NAME:-australia_job_scraper}
       - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD:-Evolgroup@123}
+      - DB_PASSWORD=${DB_PASSWORD:-Technobits@123}
       - DB_HOST=host.docker.internal
       - DB_PORT=5432
       - CELERY_BROKER_URL=redis://redis:6379/0
@@ -65,7 +65,7 @@ services:
       - RUNNING_IN_DOCKER=1
       - DB_NAME=${DB_NAME:-australia_job_scraper}
       - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD:-Evolgroup@123}
+      - DB_PASSWORD=${DB_PASSWORD:-Technobits@123}
       - DB_HOST=host.docker.internal
       - DB_PORT=5432
       - CELERY_BROKER_URL=redis://redis:6379/0
@@ -93,7 +93,7 @@ services:
       - RUNNING_IN_DOCKER=1
       - DB_NAME=${DB_NAME:-australia_job_scraper}
       - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD:-Evolgroup@123}
+      - DB_PASSWORD=${DB_PASSWORD:-Technobits@123}
       - DB_HOST=host.docker.internal
       - DB_PORT=5432
       - CELERY_BROKER_URL=redis://redis:6379/0

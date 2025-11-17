@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
-Professional Prosple Australia Job Scraper using Playwright
-===========================================================
+Professional Prosple Australia Job Scraper using Playwright with ETL Pipeline
+==============================================================================
 
 Advanced Playwright-based scraper for Prosple Australia (https://au.prosple.com/search-jobs) 
-that integrates with your existing job scraper project database structure:
+that integrates with your existing ETL pipeline:
 
+ETL FLOW:
+---------
+1. Scraper → StagingJob (raw data)
+2. ETL Processing → VaultJob (employer data) + PortalJob (public listings)
+3. Skill extraction → SkillMaster (auto-learning)
+4. Final output → JobPosting (after ETL transformation)
+
+Scraper Features:
 - Uses Playwright for modern, reliable web scraping
+- Saves raw data to StagingJob table (ETL first stage)
 - Professional database structure (JobPosting, Company, Location)
 - Automatic job categorization using JobCategorizationService
 - Human-like behavior to avoid detection
 - Enhanced duplicate detection
 - Comprehensive error handling and logging
 - Graduate and entry-level job optimization
+- ETL-ready data saved to StagingJob table
 
 Features:
 - 🎯 Smart job data extraction from Prosple Australia
@@ -20,13 +30,28 @@ Features:
 - 🛡️ Duplicate detection and data validation
 - 📈 Detailed scraping statistics and summaries
 - 🔄 Professional graduate job categorization
+- 🔄 ETL pipeline integration for professional data flow
 
 Usage:
-    python prosple_australia_scraper.py [job_limit]
+    # RECOMMENDED - One-step automation (scrape + ETL)
+    python prosple_australia_scraper.py --auto-etl           # Scrape all + auto ETL
+    python prosple_australia_scraper.py 20 --auto-etl        # Scrape 20 + auto ETL
+    
+    # Two-step manual process
+    python prosple_australia_scraper.py 30                   # Scrape only
+    python manage.py run_etl_pipeline --source=prosple.com.au  # Then run ETL
+    
+    # Other options
+    python prosple_australia_scraper.py 100 --reset          # Clear staging first
+    python prosple_australia_scraper.py                      # Scrape all jobs
     
 Examples:
-    python prosple_australia_scraper.py 20    # Scrape 20 jobs
-    python prosple_australia_scraper.py       # Scrape all available jobs
+    python prosple_australia_scraper.py 20 --auto-etl     # Scrape 20 jobs + ETL
+    python prosple_australia_scraper.py --auto-etl        # Scrape ALL jobs + ETL
+    python prosple_australia_scraper.py 50                # Scrape 50 (staging only)
+
+Note: Use --auto-etl flag for full automation (scraping + ETL in one command)
+      Perfect for schedulers and cron jobs!
 """
 
 import os
@@ -57,6 +82,7 @@ from apps.jobs.models import JobPosting
 from apps.companies.models import Company
 from apps.core.models import Location
 from apps.jobs.services import JobCategorizationService
+from apps.jobs.etl_helpers import save_to_staging
 
 User = get_user_model()
 
@@ -1419,186 +1445,215 @@ class ProspleAustraliaScraper:
             return 'other'
 
     def save_job_from_data(self, job_data, page):
-        """Save job to database from JSON data with proper error handling"""
+        """Save job to StagingJob for ETL processing"""
         try:
-            with transaction.atomic():
-                # Enhanced duplicate detection using multiple fields
-                if not job_data.get('url'):
-                    logger.warning(f"No URL for job: {job_data.get('title', 'Unknown')}")
-                    return False
-                
-                # Check for duplicates by URL first
-                logger.info(f"CHECKING FOR DUPLICATE with URL: {job_data['url']}")
-                existing_job = JobPosting.objects.filter(external_url=job_data['url']).first()
-                if existing_job:
-                    logger.info(f"DUPLICATE FOUND - Job exists in database: {existing_job.title} (ID: {existing_job.id})")
-                    logger.info(f"   Existing URL: {existing_job.external_url}")
-                    logger.info(f"   Scraped at: {existing_job.scraped_at}")
-                    self.stats['duplicate_jobs'] += 1
-                    return False
-                else:
-                    logger.info(f"NO DUPLICATE FOUND - Job is new!")
-                
-                # Additional duplicate check by title + company
-                if job_data.get('title') and job_data.get('company'):
-                    logger.info(f"SECONDARY CHECK - Title+Company: '{job_data['title']}' at '{job_data['company']}'")
-                    existing_job_by_title = JobPosting.objects.filter(
-                        title__iexact=job_data['title'],
-                        company__name__iexact=job_data['company'],
-                        external_source='prosple.com.au'
-                    ).first()
-                    if existing_job_by_title:
-                        logger.info(f"DUPLICATE FOUND by Title+Company: {existing_job_by_title.title} (ID: {existing_job_by_title.id})")
-                        logger.info(f"   Company: {existing_job_by_title.company.name}")
-                        logger.info(f"   External Source: {existing_job_by_title.external_source}")
-                        self.stats['duplicate_jobs'] += 1
-                        return False
+            # Validation
+            job_title = job_data.get('title', '').strip()
+            job_url = job_data.get('url', '')
+            
+            if not job_title or not job_url:
+                logger.warning(f"Missing required fields (title or URL) for job: {job_title}")
+                self.stats['errors'] += 1
+                return False
+            
+            # Extract detailed job information from the individual job page
+            job_details = None
+            if job_data.get('url'):
+                try:
+                    # Always use the existing page to avoid async/sync conflicts
+                    if page is not None:
+                        job_details = self.get_job_details(job_data['url'], page)
+                    if job_details:
+                        logger.info(f"✅ EXTRACTED FULL DETAILS from detail page for: {job_data['title']}")
                     else:
-                        logger.info(f"NO TITLE+COMPANY DUPLICATE - Job is new!")
-                
-                # Extract detailed job information from the individual job page
-                job_details = None
-                if job_data.get('url'):
-                    try:
-                        # Always use the existing page to avoid async/sync conflicts
-                        if page is not None:
-                            job_details = self.get_job_details(job_data['url'], page)
-                        if job_details:
-                            logger.info(f"✅ EXTRACTED FULL DETAILS from detail page for: {job_data['title']}")
-                        else:
-                            logger.warning("No page context available for detailed extraction")
-                            job_details = None
-                        
-                    except Exception as e:
-                        logger.warning(f"Error getting job details from page: {e}")
+                        logger.warning("No page context available for detailed extraction")
                         job_details = None
-                
-                # If job_details extraction failed, use JSON data as fallback
-                if not job_details:
-                    logger.info(f"Using Next.js JSON data as fallback for: {job_data['title']}")
-                    job_details = {
-                        'description': job_data.get('description', ''),
-                        'company': job_data.get('company', 'Unknown Company'),
-                        'location': job_data.get('location', 'Australia'),
-                        'salary_min': job_data.get('salary_min'),
-                        'salary_max': job_data.get('salary_max'),
-                        'salary_type': 'yearly',
-                        'salary_raw_text': '',
-                        'job_type': job_data.get('job_type', 'graduate'),
-                        'closing_date': None,
-                        'industry': '',
-                        'job_level': 'graduate'
-                    }
-                else:
-                    # Use data from detail page but supplement with Next.js data where needed
-                    if not job_details.get('company') or job_details['company'] == 'Unknown Company':
-                        job_details['company'] = job_data.get('company', 'Unknown Company')
-                    if not job_details.get('location') or job_details['location'] == 'Australia':
-                        job_details['location'] = job_data.get('location', 'Australia')
-                    if not job_details.get('salary_min') and job_data.get('salary_min'):
-                        job_details['salary_min'] = job_data.get('salary_min')
-                        job_details['salary_max'] = job_data.get('salary_max')
-                    if not job_details.get('job_type') or job_details['job_type'] == 'full_time':
-                        # Try to get job type from Next.js data if detail page didn't find it
-                        if job_data.get('job_type'):
-                            job_details['job_type'] = job_data.get('job_type')
-                        else:
-                            job_details['job_type'] = 'graduate'  # Default for prosple
-                
-                # Build salary raw text from min/max if available
-                if job_data.get('salary_min') and job_data.get('salary_max'):
-                    currency = job_data.get('salary_currency', 'AUD')
-                    job_details['salary_raw_text'] = f"{currency} {job_data['salary_min']:,} - {job_data['salary_max']:,}"
-                
-                # Enhanced description handling - prefer detail page description over JSON data
-                if job_details.get('description') and len(job_details['description']) > 200:
-                    # We got a good description from the detail page, keep it
-                    logger.info(f"Using full description from detail page ({len(job_details['description'])} chars)")
-                else:
-                    # Build enhanced description from available data
-                    description_parts = []
-                    if job_data.get('description') and len(job_data.get('description', '')) > 50:
-                        description_parts.append(job_data['description'])
-                    else:
-                        # Build description from available data
-                        description_parts.append(f"Position: {job_data.get('title', 'Graduate Position')}")
-                        description_parts.append(f"Company: {job_data.get('company', 'Unknown Company')}")
-                        description_parts.append(f"Location: {job_data.get('location', 'Australia')}")
-                        
-                        if job_details.get('salary_raw_text'):
-                            description_parts.append(f"Salary: {job_details['salary_raw_text']}")
-                        
-                        if job_data.get('application_deadline'):
-                            description_parts.append(f"Application Deadline: {job_data['application_deadline']}")
-                        
-                        if job_data.get('remote_available'):
-                            description_parts.append("Remote work available")
-                        
-                        description_parts.append("This is a graduate and professional opportunity posted on Prosple Australia.")
-                        description_parts.append(f"For full job details, visit: {job_data.get('url', 'https://au.prosple.com')}")
                     
-                    job_details['description'] = '\n'.join(description_parts)
-                    logger.info(f"Built fallback description ({len(job_details['description'])} chars)")
+                except Exception as e:
+                    logger.warning(f"Error getting job details from page: {e}")
+                    job_details = None
+            
+            # If job_details extraction failed, use JSON data as fallback
+            if not job_details:
+                logger.info(f"Using Next.js JSON data as fallback for: {job_data['title']}")
+                job_details = {
+                    'description': job_data.get('description', ''),
+                    'company': job_data.get('company', 'Unknown Company'),
+                    'location': job_data.get('location', 'Australia'),
+                    'salary_min': job_data.get('salary_min'),
+                    'salary_max': job_data.get('salary_max'),
+                    'salary_type': 'yearly',
+                    'salary_raw_text': '',
+                    'job_type': job_data.get('job_type', 'graduate'),
+                    'closing_date': None,
+                    'industry': '',
+                    'job_level': 'graduate'
+                }
+            else:
+                # Use data from detail page but supplement with Next.js data where needed
+                if not job_details.get('company') or job_details['company'] == 'Unknown Company':
+                    job_details['company'] = job_data.get('company', 'Unknown Company')
+                if not job_details.get('location') or job_details['location'] == 'Australia':
+                    job_details['location'] = job_data.get('location', 'Australia')
+                if not job_details.get('salary_min') and job_data.get('salary_min'):
+                    job_details['salary_min'] = job_data.get('salary_min')
+                    job_details['salary_max'] = job_data.get('salary_max')
+                if not job_details.get('job_type') or job_details['job_type'] == 'full_time':
+                    # Try to get job type from Next.js data if detail page didn't find it
+                    if job_data.get('job_type'):
+                        job_details['job_type'] = job_data.get('job_type')
+                    else:
+                        job_details['job_type'] = 'graduate'  # Default for prosple
+            
+            # Build salary raw text from min/max if available
+            salary_raw_text = ''
+            if job_data.get('salary_min') and job_data.get('salary_max'):
+                currency = job_data.get('salary_currency', 'AUD')
+                salary_raw_text = f"{currency} {job_data['salary_min']:,} - {job_data['salary_max']:,}"
+            elif job_details.get('salary_raw_text'):
+                salary_raw_text = job_details['salary_raw_text']
+            
+            # Enhanced description handling - prefer detail page description over JSON data
+            if job_details.get('description') and len(job_details['description']) > 200:
+                # We got a good description from the detail page, keep it
+                logger.info(f"Using full description from detail page ({len(job_details['description'])} chars)")
+            else:
+                # Build enhanced description from available data
+                description_parts = []
+                if job_data.get('description') and len(job_data.get('description', '')) > 50:
+                    description_parts.append(job_data['description'])
+                else:
+                    # Build description from available data
+                    description_parts.append(f"Position: {job_data.get('title', 'Graduate Position')}")
+                    description_parts.append(f"Company: {job_data.get('company', 'Unknown Company')}")
+                    description_parts.append(f"Location: {job_data.get('location', 'Australia')}")
+                    
+                    if salary_raw_text:
+                        description_parts.append(f"Salary: {salary_raw_text}")
+                    
+                    if job_data.get('application_deadline'):
+                        description_parts.append(f"Application Deadline: {job_data['application_deadline']}")
+                    
+                    if job_data.get('remote_available'):
+                        description_parts.append("Remote work available")
+                    
+                    description_parts.append("This is a graduate and professional opportunity posted on Prosple Australia.")
+                    description_parts.append(f"For full job details, visit: {job_data.get('url', 'https://au.prosple.com')}")
                 
-                # Parse closing date if available
-                if job_data.get('application_deadline'):
-                    job_details['closing_date'] = self.parse_closing_date(job_data['application_deadline'])
+                job_details['description'] = '\n'.join(description_parts)
+                logger.info(f"Built fallback description ({len(job_details['description'])} chars)")
+            
+            # Parse closing date if available
+            closing_date_str = ''
+            if job_data.get('application_deadline'):
+                closing_date_obj = self.parse_closing_date(job_data['application_deadline'])
+                if closing_date_obj:
+                    closing_date_str = closing_date_obj.isoformat()
+            elif job_details.get('closing_date'):
+                if hasattr(job_details['closing_date'], 'isoformat'):
+                    closing_date_str = job_details['closing_date'].isoformat()
+                else:
+                    closing_date_str = str(job_details['closing_date'])
+            
+            # Extract skills from description
+            skills, preferred_skills = self.extract_skills_from_description(job_details['description'], job_data['title'])
+            
+            # Categorize job
+            category = self.categorize_job(job_data['title'], job_details['description'], job_details['company'])
+            
+            # Generate tags
+            tags_list = JobCategorizationService.get_job_keywords(
+                job_data['title'], 
+                job_details.get('description', '')
+            )
+            # Add graduate-specific tags
+            graduate_tags = ['graduate', 'professional', 'entry-level']
+            tags_list.extend(graduate_tags)
+            
+            # Map job_type to standard format
+            job_type_map = {
+                'full_time': 'Full-time',
+                'part_time': 'Part-time',
+                'contract': 'Contract',
+                'temporary': 'Temporary',
+                'casual': 'Casual',
+                'internship': 'Internship',
+                'graduate': 'Graduate'
+            }
+            job_type = job_type_map.get(job_details.get('job_type', 'graduate'), 'Graduate')
+            
+            # Use external_url as external_id (unique identifier)
+            external_id = job_url.split('/')[-2] if job_url.endswith('/') else job_url.split('/')[-1]
+            
+            # Prepare staging data
+            staging_data = {
+                'title': job_title,
+                'description': job_details.get('description', ''),
+                'company_name': job_details.get('company', 'Unknown Company'),
+                'location': job_details.get('location', 'Australia'),
+                'salary': salary_raw_text,
+                'job_type': job_type,
+                'category': category,
+                'posted_ago': job_data.get('posted_ago', ''),
                 
-                # Get or create company
-                company = self.get_or_create_company(job_details['company'])
+                # Additional fields
+                'employment_type': job_type,
+                'work_mode': 'on_site',
+                'skills': skills[:200] if skills else '',
+                'preferred_skills': preferred_skills[:200] if preferred_skills else '',
+                'closing_date': closing_date_str,
+                'posted_date': '',
+                'experience_level': 'graduate',
                 
-                # Get or create location
-                location = self.get_or_create_location(job_details['location'])
-                
-                # Extract skills from description
-                skills, preferred_skills = self.extract_skills_from_description(job_details['description'], job_data['title'])
-                
-                # Update company logo if available
-                if job_data.get('company_logo') and company:
-                    if not company.logo:  # Only update if company doesn't have a logo
-                        company.logo = job_data['company_logo']
-                        company.save()
-                        logger.info(f"Updated company logo for {company.name}")
-                
-                # Categorize job
-                category = self.categorize_job(job_data['title'], job_details['description'], job_details['company'])
-                
-                # Create job posting
-                job_posting = JobPosting.objects.create(
-                    title=job_data['title'][:200],
-                    description=job_details['description'],
-                    company=company,
-                    location=location,
-                    posted_by=self.default_user,
-                    job_category=category,
-                    job_type=job_details['job_type'],
-                    salary_min=job_details['salary_min'],
-                    salary_max=job_details['salary_max'],
-                    salary_type=job_details['salary_type'],
-                    salary_raw_text=job_details['salary_raw_text'][:200] if job_details['salary_raw_text'] else '',
-                    external_source='prosple.com.au',
-                    external_url=job_data['url'][:500] if job_data['url'] else '',
-                    posted_ago=job_data.get('posted_ago', '')[:50],
-                    status='active',
-                    # New fields
-                    job_closing_date=job_data.get('closing_date', job_data.get('application_deadline')),
-                    skills=skills[:200] if skills else '',
-                    preferred_skills=preferred_skills[:200] if preferred_skills else '',
-                    additional_info={
-                        'closing_date': job_details['closing_date'].isoformat() if job_details['closing_date'] else None,
-                        'industry': job_details['industry'],
-                        'job_level': job_details['job_level'],
-                        'scrape_timestamp': datetime.now().isoformat(),
-                        'source_type': 'nextjs_json'
-                    }
-                )
-                
-                logger.info(f"Saved job: {job_data['title']} at {company.name}")
-                self.stats['new_jobs'] += 1
-                return True
+                # Store all raw data for ETL processing
+                'raw_prosple_data': {
+                    'salary_min': str(job_details.get('salary_min', '')) if job_details.get('salary_min') else '',
+                    'salary_max': str(job_details.get('salary_max', '')) if job_details.get('salary_max') else '',
+                    'salary_currency': job_data.get('salary_currency', 'AUD'),
+                    'salary_type': job_details.get('salary_type', 'yearly'),
+                    'industry': job_details.get('industry', ''),
+                    'job_level': job_details.get('job_level', 'graduate'),
+                    'remote_available': job_data.get('remote_available', False),
+                    'sponsored': job_data.get('sponsored', False),
+                    'company_logo': job_data.get('company_logo', ''),
+                    'tags': ','.join(list(set(tags_list))[:15]),
+                    'scraper_version': 'Prosple-Playwright-Australia-1.0-ETL',
+                    'country': 'Australia',
+                    'source_type': 'nextjs_json'
+                }
+            }
+            
+            # Save to staging using ETL helper
+            staging_job, created = save_to_staging(
+                source='prosple.com.au',
+                job_url=job_url,
+                job_data=staging_data,
+                external_id=external_id
+            )
+            
+            if not staging_job:
+                logger.error(f"Failed to save to staging: {job_title}")
+                self.stats['errors'] += 1
+                return False
+            
+            if not created:
+                logger.info(f"[DUPLICATE] Skipped duplicate job: {job_title}")
+                self.stats['duplicate_jobs'] += 1
+                return "duplicate"
+            
+            # Success - log details
+            logger.info(f"[SUCCESS] Saved to staging: {job_title}")
+            logger.info(f"  Company: {staging_data['company_name']}")
+            logger.info(f"  Category: {staging_data['category']}")
+            logger.info(f"  Location: {staging_data['location']}")
+            logger.info(f"  Skills ({len(skills.split(',')) if skills else 0}): {skills or 'Not specified'}")
+            
+            self.stats['new_jobs'] += 1
+            return True
                 
         except Exception as e:
-            logger.error(f"Error saving job {job_data.get('title', 'Unknown')}: {e}")
+            logger.error(f"Error saving job to staging: {e}")
+            logger.exception(e)
             self.stats['errors'] += 1
             return False
 
@@ -2340,36 +2395,281 @@ class ProspleAustraliaScraper:
         logger.info("=" * 60)
 
 
+def reset_database():
+    """Reset/clear all Prosple Jobs data from staging."""
+    try:
+        from apps.jobs.models import StagingJob
+        deleted_count = StagingJob.objects.filter(external_source='prosple.com.au').count()
+        StagingJob.objects.filter(external_source='prosple.com.au').delete()
+        logger.info(f"[RESET] Cleared {deleted_count} Prosple jobs from staging")
+        return True
+    except Exception as e:
+        logger.error(f"[RESET] Failed to clear staging: {e}")
+        return False
+
+
+def run_etl_processing(scraper=None):
+    """Run ETL processing on scraped Prosple jobs."""
+    try:
+        print("")
+        print("=" * 70)
+        print("🔄 STARTING ETL PROCESSING")
+        print("=" * 70)
+        print("Processing staging jobs → VaultJob + PortalJob → JobPosting...")
+        print("")
+        
+        # Import ETL processor
+        from apps.jobs.etl_processor import ETLProcessor
+        from apps.jobs.models import StagingJob
+        
+        # Get scraper statistics (always record, even if no new jobs)
+        scraper_stats = None
+        if scraper:
+            scraper_stats = {
+                'jobs_scraped': scraper.stats.get('new_jobs', 0),  # Jobs saved to staging
+                'duplicates_found': scraper.stats.get('duplicate_jobs', 0),  # Scraper duplicates
+                'errors': scraper.stats.get('errors', 0)
+            }
+        
+        # Check if there are jobs to process
+        pending_count = StagingJob.objects.filter(
+            external_source='prosple.com.au',
+            is_processed=False
+        ).count()
+        
+        # Initialize empty results for when no ETL processing happens
+        results = {
+            'successful': 0,
+            'failed': 0,
+            'duplicates': 0,
+            'new_skills': 0
+        }
+        
+        if pending_count == 0:
+            print("No pending Prosple jobs to process in staging")
+            # Still create summary record even if no ETL processing
+            create_job_ingestion_summary(results, source='prosple.com.au', scraper_stats=scraper_stats)
+            return results
+        
+        print(f"Found {pending_count} Prosple jobs pending ETL processing...")
+        
+        # Run ETL processor
+        processor = ETLProcessor()
+        results = processor.process_staging_jobs(source='prosple.com.au')
+        
+        # Create or update JobIngestionSummary record
+        create_job_ingestion_summary(results, source='prosple.com.au', scraper_stats=scraper_stats)
+        
+        # Print only final results
+        print(f"ETL: Processed {results['successful']}, Failed {results['failed']}, Duplicates {results['duplicates']}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"❌ ETL PROCESSING FAILED: {str(e)}")
+        raise
+
+
+def create_scraping_summary(scraper):
+    """Create JobIngestionSummary record for scraping-only execution (no ETL)."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        source = 'prosple.com.au'
+        
+        # Create NEW record for each execution (not get_or_create)
+        source_breakdown = {
+            source: {
+                'scraped': scraper.stats.get('new_jobs', 0),
+                'processed': 0,
+                'failed': 0,
+                'duplicates': scraper.stats.get('duplicate_jobs', 0)
+            }
+        }
+        
+        summary = JobIngestionSummary.objects.create(
+            summary_date=today,
+            source=source,  # Add source field
+            execution_started_at=timezone.now(),
+            execution_finished_at=timezone.now(),
+            total_scraped=scraper.stats.get('new_jobs', 0),
+            total_processed=0,
+            total_duplicates=scraper.stats.get('duplicate_jobs', 0),
+            total_errors=scraper.stats.get('errors', 0),
+            new_skills_added=0,
+            status='success' if scraper.stats.get('errors', 0) == 0 else 'partial',
+            source_breakdown=source_breakdown
+        )
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Created JobIngestionSummary #{summary.id} for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper.stats.get('new_jobs', 0)}")
+        print(f"   Duplicates: {scraper.stats.get('duplicate_jobs', 0)}")
+        print(f"   Errors: {scraper.stats.get('errors', 0)}")
+        print("   Note: ETL not run (use --auto-etl flag to process jobs)")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
+def create_job_ingestion_summary(results, source, scraper_stats=None):
+    """Create or update JobIngestionSummary record for daily tracking per source."""
+    try:
+        from apps.jobs.models import JobIngestionSummary
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Each source gets its own daily record
+        summary, created = JobIngestionSummary.objects.get_or_create(
+            summary_date=today,
+            source=source,  # SEPARATE record per source
+            defaults={
+                'execution_started_at': timezone.now(),
+                'total_scraped': 0,
+                'total_processed': 0,
+                'total_duplicates': 0,
+                'total_errors': 0,
+                'new_skills_added': 0,
+                'status': 'running'
+            }
+        )
+        
+        # Update summary with scraper statistics (if available)
+        if scraper_stats:
+            summary.total_scraped += scraper_stats.get('jobs_scraped', 0)
+            # Add scraper duplicates to total duplicates
+            summary.total_duplicates += scraper_stats.get('duplicates_found', 0)
+            # Add scraper errors to total errors
+            summary.total_errors += scraper_stats.get('errors', 0)
+        
+        # Update summary with ETL results
+        summary.total_processed += results['successful']
+        summary.total_errors += results['failed']
+        summary.new_skills_added += results['new_skills']
+        summary.execution_finished_at = timezone.now()
+        summary.status = 'success' if results['failed'] == 0 else 'partial'
+        
+        # Update source breakdown
+        source_breakdown = summary.source_breakdown or {}
+        source_key = source or 'all_sources'
+        
+        if source_key not in source_breakdown:
+            source_breakdown[source_key] = {
+                'scraped': 0,
+                'processed': 0,
+                'failed': 0,
+                'duplicates': 0
+            }
+        
+        # Add scraper stats to source breakdown
+        if scraper_stats:
+            source_breakdown[source_key]['scraped'] = source_breakdown[source_key].get('scraped', 0) + scraper_stats.get('jobs_scraped', 0)
+            source_breakdown[source_key]['duplicates'] = source_breakdown[source_key].get('duplicates', 0) + scraper_stats.get('duplicates_found', 0)
+        
+        # Add ETL stats to source breakdown
+        source_breakdown[source_key]['processed'] = source_breakdown[source_key].get('processed', 0) + results['successful']
+        source_breakdown[source_key]['failed'] = source_breakdown[source_key].get('failed', 0) + results['failed']
+        
+        summary.source_breakdown = source_breakdown
+        summary.save()
+        
+        print("")
+        print("=" * 70)
+        print(f"📈 Updated JobIngestionSummary for {today} ({source})")
+        print(f"   Source: {source}")
+        print(f"   Scraped: {scraper_stats.get('jobs_scraped', 0) if scraper_stats else 0}")
+        print(f"   Processed: {results['successful']}")
+        print(f"   Duplicates: {scraper_stats.get('duplicates_found', 0) if scraper_stats else 0}")
+        print(f"   Errors (Scraper): {scraper_stats.get('errors', 0) if scraper_stats else 0}")
+        print(f"   Errors (ETL): {results['failed']}")
+        print(f"   New Skills: {results['new_skills']}")
+        print("=" * 70)
+        
+    except Exception as e:
+        print(f"⚠️  Could not create JobIngestionSummary: {e}")
+
+
 def main():
     """Main function"""
-    max_jobs = None
+    import argparse
     
     # Parse command line arguments
-    if len(sys.argv) > 1:
-        try:
-            max_jobs = int(sys.argv[1])
-            logger.info(f"Job limit set to: {max_jobs}")
-        except ValueError:
-            logger.error("Invalid job limit. Please provide a number.")
-            sys.exit(1)
+    parser = argparse.ArgumentParser(description='Prosple Australia Professional Scraper with ETL')
+    parser.add_argument('job_limit', type=int, nargs='?', default=None,
+                       help='Maximum number of jobs to scrape (default: unlimited)')
+    parser.add_argument('--reset', action='store_true',
+                       help='Clear all existing Prosple jobs data before scraping')
+    parser.add_argument('--auto-etl', action='store_true',
+                       help='Automatically run ETL processing after scraping')
     
-    # Create and run scraper (headless=False to see the browser)
-    scraper = ProspleAustraliaScraper(max_jobs=max_jobs, headless=True)
-    scraper.scrape_jobs()
+    args = parser.parse_args()
+    
+    # Handle database reset if requested
+    if args.reset:
+        logger.info("Clearing existing Prosple jobs data...")
+        if not reset_database():
+            logger.error("Failed to reset staging, exiting")
+            return
+    
+    # Set job limit
+    max_jobs = args.job_limit
+    if max_jobs:
+        logger.info(f"Job limit set to: {max_jobs}")
+    else:
+        logger.info("Job limit: unlimited")
+    
+    # Initialize and run scraper
+    try:
+        scraper = ProspleAustraliaScraper(max_jobs=max_jobs, headless=True)
+        scraper.scrape_jobs()
+        
+        # Run ETL if auto-etl flag is set
+        if args.auto_etl:
+            run_etl_processing(scraper)
+        else:
+            # If not running ETL, still create summary record for scraping activity
+            create_scraping_summary(scraper)
+            
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user")
+    except Exception as e:
+        logger.error(f"Scraping failed: {str(e)}")
+        raise
 
 
 def run(max_jobs=None, headless=True):
-    """Automation entrypoint for Prosple Australia scraper.
+    """Automation entrypoint for Prosple Australia scraper with auto-ETL.
 
-    Runs the scraper without CLI and returns internal stats for schedulers.
+    Runs the scraper without CLI, automatically runs ETL processing,
+    and returns internal stats for schedulers.
     """
     try:
+        # Run scraping
         scraper = ProspleAustraliaScraper(max_jobs=max_jobs, headless=headless)
         scraper.scrape_jobs()
+        
+        # Automatically run ETL processing for scheduler (pass scraper for summary)
+        try:
+            run_etl_processing(scraper)
+        except Exception as etl_error:
+            logging.getLogger(__name__).error(f"ETL processing failed: {etl_error}")
+            return {
+                'success': False,
+                'stats': getattr(scraper, 'stats', {}),
+                'message': 'Scraping succeeded but ETL failed',
+                'etl_error': str(etl_error)
+            }
+        
         return {
             'success': True,
             'stats': getattr(scraper, 'stats', {}),
-            'message': 'Prosple scraping completed'
+            'message': 'Prosple scraping and ETL completed'
         }
     except SystemExit as e:
         return {
