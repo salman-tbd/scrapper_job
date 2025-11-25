@@ -302,20 +302,85 @@ class SimpleMichaelPageScraper:
                     if not txt:
                         li.decompose()
                         continue
-                    if any(p in txt for p in contact_phrases) or re.match(r'^contact\b', txt):
+                    if any(p in txt for p in contact_phrases) or re.match(r'^contact', txt):
                         li.decompose()
                 for p in list(container.find_all('p')):
                     txt = (p.get_text(' ', strip=True) or '').lower()
-                    if any(pht in txt for pht in contact_phrases) or re.match(r'^contact\b', txt):
+                    if any(pht in txt for pht in contact_phrases) or re.match(r'^contact', txt):
                         p.decompose()
-                    # Remove paragraphs that contain phone numbers or job references
-                    if re.search(r'(phone\s*number|job\s*ref|consultant|contact\s*name)', txt):
+                    # Remove paragraphs that contain phone numbers or job references (more aggressive patterns)
+                    if re.search(r'(phone\s*number|job\s*ref|consultant|contact\s*name|contactname|quote\s*job)', txt):
                         p.decompose()
                 # Remove any empty UL/OL created by the cleanup
                 for lst in list(container.find_all(['ul', 'ol'])):
                     if not lst.find('li'):
                         lst.decompose()
+                
+                # CRITICAL: Remove all bare text nodes (NavigableString) that contain contact info
+                # These appear outside of HTML tags at the end of containers
+                from bs4 import NavigableString
+                for element in list(container.descendants):
+                    if isinstance(element, NavigableString):
+                        text = str(element).strip()
+                        if text:
+                            text_low = text.lower()
+                            # Check if this text node contains contact information keywords
+                            if any(marker in text_low for marker in [
+                                'contact', 'quote job ref', 'phone number', 'consultant'
+                            ]):
+                                element.extract()
+                                continue
+                            # Check for job reference patterns (JN-XXXXXX-XXXXXXX)
+                            if re.search(r'JN-\d{6}-\d{7}', text, re.IGNORECASE):
+                                element.extract()
+                                continue
+                            # Check for Australian phone number patterns
+                            if re.search(r'(\+\d{1,3}\s?)?[\(\d][\d\s\(\)\-]{7,}\d', text):
+                                element.extract()
+                                continue
+                            # Check for patterns like "ContactName Name" or concatenated like "NameJN-"
+                            if re.search(r'contact[a-z]+\s+[a-z]+', text_low):
+                                element.extract()
+                                continue
+                            # Check for concatenated patterns (Name+JobRef+Phone)
+                            if re.search(r'[A-Z][a-z]+JN-\d', text):
+                                element.extract()
+                                continue
+                            # Remove standalone person names (2-3 capitalized words, likely consultant names)
+                            # Only if they're short standalone text nodes (not part of sentences)
+                            if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?$', text.strip()):
+                                # It's just "Firstname Lastname" or "Firstname Middle Lastname"
+                                element.extract()
+                                continue
+                
                 html = str(container)
+                
+                # Final aggressive cleanup: Cut off everything after contact markers in the HTML string
+                # This catches any remaining contact info that slipped through
+                contact_markers = [
+                    r'Contact[A-Z][a-z]+\s+[A-Z][a-z]+',  # ContactFirstname Lastname
+                    r'Contact[A-Z][a-z]+',  # ContactFirstname (no space)
+                    r'[A-Z][a-z]+\s+[A-Z][a-z]+JN-\d',  # Name NameJN-XXXX
+                    r'[A-Z][a-z]+JN-\d{6}-\d{7}',  # NameJN-XXXXXX-XXXXXXX (concatenated)
+                    r'JN-\d{6}-\d{7}',  # Job reference pattern
+                    r'Quote\s*job\s*ref',
+                    r'Phone\s*number',
+                    r'Consultant\s*name',
+                    r'\+\(\d{2}\)\s?\d{9}',  # Phone pattern like +(61) 414366403
+                    r'\+\d{1,3}\s?\d{9,}',  # International phone pattern
+                    r'</p>[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?</div>',  # Person name before closing div
+                    r'</p>[A-Z][a-z]+\s+[A-Z][a-z]+',  # Person name after closing p tag
+                ]
+                for marker in contact_markers:
+                    match = re.search(marker, html, re.IGNORECASE)
+                    if match:
+                        # Cut off everything from this point
+                        html = html[:match.start()].strip()
+                        # If we cut at </p>, add it back
+                        if marker.startswith(r'</p>'):
+                            html += '</p>'
+                        break
+                
                 # Light cleanup for excessive whitespace
                 html = re.sub(r"\n\s*\n+", "\n\n", html)
                 return html.strip()
@@ -423,7 +488,8 @@ class SimpleMichaelPageScraper:
                 remove_phrases = [
                     'job summary', 'save job', 'apply',
                     'diversity & inclusion at michael page',
-                    'other users applied', 'contact ', 'quote job ref', 'phone number'
+                    'other users applied', 'contact ', 'quote job ref', 'phone number',
+                    'consultant name', 'consultant phone', 'job reference'
                 ]
                 lines = []
                 for line in text_joined.splitlines():
@@ -437,12 +503,17 @@ class SimpleMichaelPageScraper:
                     if any(k in low for k in [
                         'consultant name', 'consultant phone', 'job reference',
                         'function', 'specialisation', "what is your industry?", 'location', 'job type',
-                        'contacthannah', "o'doherty", 'phone number'
+                        'contacthannah', "o'doherty", 'phone number', 'contact', 'quote job'
                     ]):
                         continue
-                    # Skip lines that start with Contact or contain phone/reference patterns
-                    if re.match(r'^contact', low) or re.search(r'(phone\s*number|job\s*ref|quote\s*job)', low):
+                    # Skip lines that start with Contact (with or without space) or contain phone/reference patterns
+                    if re.match(r'^contact', low) or re.search(r'(phone\s*number|job\s*ref|quote\s*job|contact[a-z]+\s+[a-z]+)', low):
                         continue
+                    # Skip standalone person names at the end (Firstname Lastname format only, no context)
+                    if re.match(r'^[a-z]+\s+[a-z]+(\s+[a-z]+)?$', low) and len(ln.split()) <= 3:
+                        # Skip if it's just 2-3 capitalized words (likely consultant name)
+                        if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?$', ln):
+                            continue
                     # Skip lines that appear to be phone numbers (digits only or mostly digits)
                     if re.match(r'^[\d\s\(\)\-]+$', ln) and len(re.sub(r'\D', '', ln)) >= 8:
                         continue
@@ -457,9 +528,49 @@ class SimpleMichaelPageScraper:
                     n = re.sub(r'\s+', ' ', ln.strip().lower())
                     if n in seen:
                         continue
+                    # Final aggressive filter: Remove any line with "Contact" followed by a name (no space)
+                    # Pattern: ContactFirstnameLastname or Contact Firstname Lastname
+                    if re.search(r'contact[a-z]+\s+[a-z]+', n) or re.search(r'^contact\s*[a-z]', n):
+                        continue
+                    # Remove lines that are just phone numbers or job references
+                    if re.search(r'(quote\s*job\s*ref|phone\s*number|consultant\s*name)', n):
+                        continue
                     seen.add(n)
                     cleaned.append(ln)
-                return '\n'.join(cleaned)
+                
+                text_result = '\n'.join(cleaned)
+                
+                # Final safety cut: Remove everything after contact markers
+                contact_cut_patterns = [
+                    r'contact[a-z]+\s+[a-z]+',  # ContactFirstname Lastname
+                    r'contact[a-z]+',  # ContactFirstname (no space)
+                    r'[a-z]+\s+[a-z]+jn-\d',  # name namejn-xxxx
+                    r'[a-z]+jn-\d{6}-\d{7}',  # namejn-xxxxxx-xxxxxxx (concatenated)
+                    r'jn-\d{6}-\d{7}',  # job reference pattern
+                    r'quote\s*job\s*ref',
+                    r'phone\s*number',
+                    r'\+\(\d{2}\)\s?\d{9}',  # phone like +(61) 414366403
+                    r'\+\d{1,3}\s?\d{9,}',  # international phone
+                ]
+                text_low = text_result.lower()
+                earliest_cut = None
+                for pattern in contact_cut_patterns:
+                    match = re.search(pattern, text_low)
+                    if match:
+                        if earliest_cut is None or match.start() < earliest_cut:
+                            earliest_cut = match.start()
+                
+                # Also check for standalone person names at the very end
+                # Pattern: ends with "\nFirstname Lastname" or "\nFirstname Middle Lastname"
+                name_at_end = re.search(r'\n[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?$', text_result)
+                if name_at_end:
+                    if earliest_cut is None or name_at_end.start() < earliest_cut:
+                        earliest_cut = name_at_end.start()
+                
+                if earliest_cut is not None:
+                    text_result = text_result[:earliest_cut].strip()
+                
+                return text_result
 
             # Try preferred selectors first
             for sel in preferred_selectors:
