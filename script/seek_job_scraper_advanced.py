@@ -402,22 +402,48 @@ class ProfessionalSeekScraper:
                 except:
                     pass
             
-            # Remove ALL <a> tags but keep their text content
+            # Remove ALL <a> tags and anonymize URLs
             for a_tag in soup.select('a'):
                 try:
-                    # Replace link with its text content
-                    text = a_tag.get_text()
-                    a_tag.replace_with(text)
+                    # Get link text and href
+                    text = a_tag.get_text().strip()
+                    href = a_tag.get('href', '')
+                    
+                    # Check if text looks like a URL or domain name
+                    url_patterns = [
+                        r'https?://',  # Has http:// or https://
+                        r'www\.',       # Starts with www.
+                        r'\.[a-z]{2,}$',  # Ends with domain extension like .com, .au, etc.
+                        r'\.[a-z]{2,}/',  # Has domain extension in middle
+                    ]
+                    
+                    is_url_text = any(re.search(pattern, text.lower()) for pattern in url_patterns)
+                    
+                    # If text looks like a URL or is empty, replace with generic text
+                    if is_url_text or not text or len(text) > 100:
+                        a_tag.replace_with('[Website Protected]')
+                    else:
+                        # Keep descriptive text like "Click here", "Apply now", etc.
+                        a_tag.replace_with(text)
                 except:
+                    a_tag.replace_with('[Website Protected]')
                     pass
             
             # Get the cleaned HTML
             cleaned_html = str(soup)
             
+            # Remove any remaining URLs in plain text
+            url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+            cleaned_html = re.sub(url_pattern, '[Website Protected]', cleaned_html)
+            
+            # Remove domain names that look like websites (e.g., "example.com", "company.com.au")
+            domain_pattern = r'\b[a-zA-Z0-9-]+\.(com|org|net|edu|gov|au|uk|co\.uk|com\.au|co\.nz|io|dev|app)\b'
+            cleaned_html = re.sub(domain_pattern, '[Website Protected]', cleaned_html)
+            
             # Remove email addresses from the HTML (as text)
             # Pattern to match email addresses
             email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-            cleaned_html = re.sub(email_pattern, '[email protected]', cleaned_html)
+            cleaned_html = re.sub(email_pattern, '[Email Protected]', cleaned_html)
             
             # Remove phone numbers (Australian format)
             phone_patterns = [

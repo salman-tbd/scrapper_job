@@ -661,8 +661,8 @@ class PortalJob(models.Model):
     This is the final stage of the ETL pipeline.
     NO employer contact details are stored here.
     """
-    # Link to vault (for admin reference only)
-    vault_job = models.ForeignKey(VaultJob, on_delete=models.CASCADE, related_name='portal_listings')
+    # Link to vault (for admin reference only - optional for direct imports)
+    vault_job = models.ForeignKey(VaultJob, on_delete=models.CASCADE, related_name='portal_listings', null=True, blank=True)
     
     # Unique identifier
     JOB_TYPE_CHOICES = [
