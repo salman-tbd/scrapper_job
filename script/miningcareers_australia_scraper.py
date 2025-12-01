@@ -1144,21 +1144,69 @@ class MiningCareersJobScraper:
                             for link in soup.find_all('a'):
                                 link_text = link.get_text().lower().strip()
                                 if any(phrase in link_text for phrase in [
-                                    'see all jobs', 'view company', 'apply now', 'get this job',
-                                    'apply via', 'company website', 'let\'s get to work',
-                                    'see all company jobs', 'apply for this job', 'rio tinto',
-                                    'logo image', 'apply for this job'
+                                    'see all jobs', 'view company',
+                                    'see all company jobs',
+                                    'logo image', 'view all jobs', 'more jobs'
                                 ]):
                                     link.decompose()
+                            
+                            # Remove specific application CTA elements (buttons, divs, paragraphs)
+                            # Use "contains" logic instead of exact match to catch all variations
+                            application_cta_keywords = [
+                                'apply for this job',
+                                'apply via the company',
+                                'let\'s get to work',
+                                'lets get to work',
+                                'get this job',
+                                'apply online',
+                                'click here to apply',
+                                'click to apply',
+                                'apply now',
+                                'interviews are kicking off',
+                                'got questions? reach out',
+                                'reach out to',
+                                'don\'t miss your shot',
+                                'this one\'s worth it',
+                                'worth applying'
+                            ]
+                            
+                            # Remove any element that contains application CTA text
+                            for element in soup.find_all(['a', 'button', 'div', 'p', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                                element_text = element.get_text().lower().strip()
+                                # Check if element contains any CTA keyword
+                                if any(keyword in element_text for keyword in application_cta_keywords):
+                                    # Only remove if it's ONLY the CTA (not part of larger content)
+                                    if len(element_text) < 100:  # Short elements are likely CTAs
+                                        element.decompose()
                             
                             # Remove ALL images and logos as shown in user screenshot
                             for img in soup.find_all('img'):
                                 img.decompose()
                             
-                            # Remove divs that contain only company names or logo references
+                            # Remove ALL icons (SVG, i tags, icon fonts, etc.)
+                            for svg in soup.find_all('svg'):
+                                svg.decompose()
+                            
+                            for icon in soup.find_all('i'):
+                                # Check if it's an icon element (usually has class like 'fa', 'icon', etc.)
+                                icon_classes = icon.get('class', [])
+                                if icon_classes:
+                                    class_str = ' '.join(icon_classes).lower()
+                                    if any(icon_type in class_str for icon_type in ['icon', 'fa', 'glyphicon', 'material-icons', 'mdi', 'bi']):
+                                        icon.decompose()
+                            
+                            # Remove span elements that are likely icons
+                            for span in soup.find_all('span'):
+                                span_classes = span.get('class', [])
+                                if span_classes:
+                                    class_str = ' '.join(span_classes).lower()
+                                    if any(icon_type in class_str for icon_type in ['icon', 'fa', 'glyphicon', 'material-icons', 'mdi', 'bi']):
+                                        span.decompose()
+                            
+                            # Remove divs that contain only company names or application CTAs
                             for div in soup.find_all('div'):
                                 div_text = div.get_text().strip().lower()
-                                if div_text in ['rio tinto', 'bhp', 'logo image', 'apply for this job', 'let\'s get to work']:
+                                if div_text in ['rio tinto', 'bhp', 'logo image']:
                                     div.decompose()
                             
                             # Clean text content - LESS RESTRICTIVE TO CAPTURE ALL CONTENT
@@ -1172,12 +1220,33 @@ class MiningCareersJobScraper:
                                 'footer navigation', 'header menu', 'sidebar menu',
                                 'what is playwright', 'welcome admin', 'view site', 'change password',
                                 'log out', 'all bookmarks', 'home page', 
-                                'powered by emailoctopus', 'emailoctopus powered',
-                                'get this job button', 'apply now button', 'get this job',
-                                'let\'s get to work', 'apply via the company', 'apply now',
-                                'pit n portal', 'apply via', 'company website', 'apply here',
-                                'click to apply', 'view all jobs', 'more jobs', 'search jobs',
-                                'see all company jobs', 'mining careers', 'apply via the company\'s website'
+                                'powered by emailoctopus', 'emailoctopus powered'
+                            ]
+                            
+                            # Specific phrases to remove (application calls to action that are NOT original content)
+                            # Use partial matching to catch all variations
+                            application_cta_keywords = [
+                                'apply for this job',
+                                'apply via the company',
+                                'let\'s get to work',
+                                'lets get to work',
+                                'get this job',
+                                'apply online',
+                                'click here to apply',
+                                'click to apply',
+                                'apply now',
+                                'interviews are kicking off',
+                                'got questions? reach out',
+                                'reach out to',
+                                'don\'t miss your shot',
+                                'this one\'s worth it',
+                                'worth applying'
+                            ]
+                            
+                            # Icon-related text to remove (Unicode symbols, icon placeholders)
+                            icon_text_patterns = [
+                                '📧', '📞', '☎', '✉', '📱', '💼', '🏢', '📍', '🌐', '🔗',  # Common emoji icons
+                                '□', '☐', '☑', '✓', '✔', '✗', '✘',  # Checkbox icons
                             ]
                             
                             # Company names to remove ONLY if they are standalone lines
@@ -1197,6 +1266,16 @@ class MiningCareersJobScraper:
                                     if any(unwanted in line_lower for unwanted in unwanted_elements):
                                         continue
                                     
+                                    # Skip lines that contain application CTA keywords (partial match)
+                                    if any(keyword in line_lower for keyword in application_cta_keywords):
+                                        # But only if the line is short (< 100 chars) - likely a standalone CTA
+                                        if len(line) < 100:
+                                            continue
+                                    
+                                    # Skip lines that are just icons or icon placeholders
+                                    if line in icon_text_patterns or all(char in icon_text_patterns for char in line):
+                                        continue
+                                    
                                     # Skip standalone company names ONLY if they are the entire line
                                     if line_lower in [company.lower() for company in company_names_to_remove]:
                                         continue
@@ -1207,6 +1286,16 @@ class MiningCareersJobScraper:
                                     
                                     # Skip lines that are just numbers (pagination)
                                     if re.match(r'^\d+$', line):
+                                        continue
+                                    
+                                    # Remove any icon characters from the line but keep the text
+                                    for icon_char in icon_text_patterns:
+                                        line = line.replace(icon_char, '')
+                                    
+                                    line = line.strip()
+                                    
+                                    # After removing icons, if line is now empty or too short, skip it
+                                    if len(line) < 2:
                                         continue
                                     
                                     # INCLUDE EVERYTHING ELSE - USER WANTS ALL DESCRIPTION CONTENT

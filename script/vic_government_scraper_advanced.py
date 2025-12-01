@@ -740,6 +740,23 @@ class VictorianGovernmentJobScraper:
             # Get cleaned HTML back
             html_content = str(soup)
             
+            # Remove email addresses (e.g., recruit@bpc.vic.gov.au, contact@example.com)
+            html_content = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '', html_content)
+            
+            # Remove website URLs and domain names
+            # Remove full URLs (http/https)
+            html_content = re.sub(r'https?://[^\s<>"]+', '', html_content)
+            # Remove domain names (e.g., careers.vic.gov.au, www.example.com)
+            html_content = re.sub(r'\b(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?\b', '', html_content)
+            
+            # Remove Australian phone numbers (various formats)
+            # Format: (03) 1234 5678, 03 1234 5678, 0412 345 678, +61 3 1234 5678, etc.
+            html_content = re.sub(r'\+?\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}', '', html_content)
+            # Format: 1300 123 456, 1800 123 456
+            html_content = re.sub(r'\b1[38]00[\s.-]?\d{3}[\s.-]?\d{3}\b', '', html_content)
+            # Format: 0412345678 (no spaces)
+            html_content = re.sub(r'\b04\d{8}\b', '', html_content)
+            
             # Clean up HTML content while preserving the structure
             # Remove potentially problematic attributes but keep the HTML tags
             html_content = re.sub(r'\s*class="[^"]*"', '', html_content)
